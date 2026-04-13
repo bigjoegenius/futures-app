@@ -1,0 +1,29 @@
+# Environment and secrets
+.env
+*.env
+
+# Database
+*.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Data caches
+*.csv
+
+# Session reports
+session_report_*.docx
