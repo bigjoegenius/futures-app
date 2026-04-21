@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+"""
+strategy_engine.py — Paper-trading engine for the futures app.
+
+What it does:
+  - You call engine.step(symbol, df) every bar (or on a schedule).
+  - It checks each enabled strategy for an entry signal.
+  - It opens / manages / closes paper positions with stops + targets.
+  - Closed trades get written to the `trades` table and also appended to
+    trade_log.json (mirrors crypto-app's format).
+
+Risk sizing:
+  - Each trade risks a fixed % of account equity based on risk_mode:
+      conservative = 0.5%, moderate = 1%, aggressive = 2%
+  - Position size is computed from (risk_dollars / distance_to_stop_per_contract).
+  - Stop is an ATR-based distance; target is 1.8x ATR by default (1R:1.8R).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sqlite3
+from dataclasses import dataclass, asdict, field
+from datetime import datetime, timezone
+from typing import Callable, Optional
+
+import numpy as np
+import pandas as pd
+
+from futures_config import DB_PATH, FUTURES
+from market_analyzer import score_strategies, load_bars, atr
+
+
+TRADE_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trade_log.json")
+
+
+# ─── Contract specs (point value, tick) ─────────────────────────────────
+# Approximations — these are the standard CME front-month point values.
+CONTRACT_SPECS: dict[str, dict] = {
+    # Equity indexes
+    "ES=F":  {"name": "E-mini S&P 500",    "point_value": 50.0,  "tick": 0.25},
+    "NQ=F":  {"name": "E-mini Nasdaq 100", "point_value": 20.0,  "tick": 0.25},
+    "YM=F":  {"name": "E-mini Dow",        "point_value": 5.0,   "tick": 1.0},
+    "RTY=F": {"name": "E-mini Russell",    "point_value": 50.0,  "tick": 0.10},
+    # Energy
+    "CL=F":  {"name": "WTI Crude Oil",     "point_value": 1000.0, "tick": 0.01},
+    "NG=F":  {"name": "Natural Gas",       "point_value": 10000.0, "tick": 0.001},
+    # Metals
+    "GC=F":  {"name": "Gold",              "point_value": 100.0, "tick": 0.10},
+    "SI=F":  {"name": "Silver",            "point_value": 5000.0, "tick": 0.005},
+    "HG=F":  {"name": "Copper",            "point_value": 25000.0, "tick": 0.0005},
+    # Bonds
+    "ZB=F":  {"name": "30Y T-Bond",        "point_value": 1000.0, "tick": 1/32},
+    "ZN=F":  {"name": "10Y T-Note",        "point_value": 1000.0, "tick": 1/64},
+    # Ags
+    "ZC=F":  {"name": "Corn",              "point_value": 50.0,  "tick": 0.25},
+    "ZS=F":  {"name": "Soybeans",          "point_value": 50.0,  "tick": 0.25},
+    "ZW=F":  {"name": "Wheat",             "point_value": 50.0,  "tick": 0.25},
+    "KC=F":  {"name": "Coffee",            "point_value": 375.0, "tick": 0.05},
+    "SB=F":  {"name": "Sugar",             "point_value": 1120.0, "tick": 0.01},
+    "CT=F":  {"name": "Cotton",            "point_value": 500.0, "tick": 0.01},
+    "LE=F":  {"name": "Live Cattle",       "point_value": 400.0, "tick": 0.025},
+}
+
+# Generic per-side commission + slippage estimate for paper trading
+FEE_PER_CONTRACT_PER_SIDE = 2.50   # $ per contract, per open or close
+SLIPPAGE_TICKS            = 1       # extra ticks against you on fill
+
+RISK_MODES = {"conservative": 0.005, "moderate": 0.01, "aggressive": 0.02}
+DEFAULT_STRATEGIES = list({
+    "ema_cross", "macd_momentum", "rsi_extreme",
+    "bb_breakout", "volume_breakout", "triple_confluence",
+})
+
+
+@dataclass
+class TradeReport:
+    symbol: str
+    strategy: str
+    direction: str              # "long" | "short"
+    entry_time: str
+    entry_price: float
+    exit_time: Optional[str] = None
+    exit_price: Optional[float] = None
+    stop_price: float = 0.0
+    target_price: float = 0.0
+    contracts: float = 0.0
+    pnl_dollars: float = 0.0
+    pnl_pct: float = 0.0
+    fees: float = 0.0
+    exit_reason: Optional[str] = None
+    status: str = "open"
+
+
+@dataclass
+class Position:
+    symbol: str
+    strategy: str
+    direction: str
+    entry_price: float
+    stop_price: float
+    target_price: float
+    contracts: float
+    entry_time: str
+    atr_at_entry: float
+
+
+class StrategyEngine:
+    def __init__(
+        self,
+        starting_balance: float = 10_000.0,
+        risk_mode: str = "moderate",
+        enabled_strategies: list[str] | None = None,
+        on_trade_closed: Callable[[TradeReport], None] | None = None,
+    ):
+        self.balance = float(starting_balance)
+        self.starting_balance = float(starting_balance)
+        self.risk_mode = risk_mode if risk_mode in RISK_MODES else "moderate"
+        self.enabled: set[str] = set(enabled_strategies or DEFAULT_STRATEGIES)
+        self.positions: dict[str, Position] = {}   # one position per symbol
+        self.closed: list[TradeReport] = []
+        self.on_trade_closed = on_trade_closed
+        self.min_score_to_enter = 60.0
+
+    # ── Config ─────────────────────────────────────────────────────────
+    def set_risk(self, mode: str) -> None:
+        if mode in RISK_MODES:
+            self.risk_mode = mode
+
+    def enable(self, strategy: str) -> None:
+        self.enabled.add(strategy)
+
+    def disable(self, strategy: str) -> None:
+        self.enabled.discard(strategy)
+
+    # ── Core loop ──────────────────────────────────────────────────────
+    def step(self, symbol: str, df: pd.DataFrame) -> None:
+        """Run one tick of the engine for one symbol."""
+        if df is None or len(df) < 60:
+            return
+        spec = CONTRACT_SPECS.get(symbol)
+        if not spec:
+            return
+
+        last = float(df["close"].iloc[-1])
+        high = float(df["high"].iloc[-1])
+        low = float(df["low"].iloc[-1])
+        now = df["datetime"].iloc[-1].isoformat() if "datetime" in df else datetime.now(timezone.utc).isoformat()
+
+        # First: manage any open position on this symbol
+        pos = self.positions.get(symbol)
+        if pos is not None:
+            self._manage_position(pos, high, low, last, now, spec)
+            # Re-check; if still open, don't open a second one
+            if symbol in self.positions:
+                return
+
+        # Second: look for entries among enabled strategies
+        scores = score_strategies(symbol, df)
+        candidates = []
+        for sid, info in scores.items():
+            if sid not in self.enabled:
+                continue
+            if info["direction"] == "NONE":
+                continue
+            if info["score"] < self.min_score_to_enter:
+                continue
+            candidates.append((sid, info))
+
+        if not candidates:
+            return
+
+        # pick the highest-scoring candidate
+        candidates.sort(key=lambda kv: kv[1]["score"], reverse=True)
+        sid, info = candidates[0]
+        atr_val = float(info["signals"].get("atr", max(last * 0.01, spec["tick"] * 4)))
+        self._open_position(symbol, sid, info["direction"].lower(), last, atr_val, now, spec)
+
+    # ── Position management ────────────────────────────────────────────
+    def _open_position(self, symbol, strategy, direction, price, atr_val, ts, spec):
+        stop_dist = max(atr_val * 1.2, spec["tick"] * 8)
+        target_dist = stop_dist * 1.8
+        if direction == "long":
+            stop = price - stop_dist
+            target = price + target_dist
+        else:
+            stop = price + stop_dist
+            target = price - target_dist
+
+        risk_dollars = self.balance * RISK_MODES[self.risk_mode]
+        # $ loss per contract if stop hits
+        loss_per_contract = stop_dist * spec["point_value"]
+        if loss_per_contract <= 0:
+            return
+        contracts = risk_dollars / loss_per_contract
+        # Round down to nearest 0.1 contracts (fractional allowed for paper)
+        contracts = max(round(contracts, 1), 0.1)
+
+        # Apply slippage on entry
+        slip = SLIPPAGE_TICKS * spec["tick"]
+        fill_price = price + slip if direction == "long" else price - slip
+
+        self.positions[symbol] = Position(
+            symbol=symbol,
+            strategy=strategy,
+            direction=direction,
+            entry_price=fill_price,
+            stop_price=stop,
+            target_price=target,
+            contracts=contracts,
+            entry_time=ts,
+            atr_at_entry=atr_val,
+        )
+
+    def _manage_position(self, pos: Position, bar_high, bar_low, bar_close, ts, spec):
+        """Check if stop or target was hit on this bar. Close if so."""
+        hit_stop = (pos.direction == "long" and bar_low <= pos.stop_price) or \
+                   (pos.direction == "short" and bar_high >= pos.stop_price)
+        hit_target = (pos.direction == "long" and bar_high >= pos.target_price) or \
+                     (pos.direction == "short" and bar_low <= pos.target_price)
+
+        if hit_stop and hit_target:
+            # Assume stop fills first (conservative)
+            self._close_position(pos, pos.stop_price, ts, "stop", spec)
+        elif hit_stop:
+            self._close_position(pos, pos.stop_price, ts, "stop", spec)
+        elif hit_target:
+            self._close_position(pos, pos.target_price, ts, "target", spec)
+
+    def close_all(self, reason: str = "manual") -> None:
+        """Force-close every open position at its last known price."""
+        for sym, pos in list(self.positions.items()):
+            df = load_bars(sym, "1h", 5) or load_bars(sym, "1d", 5)
+            if df is None or df.empty:
+                continue
+            last = float(df["close"].iloc[-1])
+            spec = CONTRACT_SPECS.get(sym)
+            if spec:
+                self._close_position(pos, last, datetime.now(timezone.utc).isoformat(), reason, spec)
+
+    def _close_position(self, pos: Position, exit_price: float, ts: str, reason: str, spec: dict):
+        slip = SLIPPAGE_TICKS * spec["tick"]
+        fill = exit_price - slip if pos.direction == "long" else exit_price + slip
+
+        if pos.direction == "long":
+            gross = (fill - pos.entry_price) * spec["point_value"] * pos.contracts
+        else:
+            gross = (pos.entry_price - fill) * spec["point_value"] * pos.contracts
+
+        fees = FEE_PER_CONTRACT_PER_SIDE * 2 * pos.contracts
+        pnl = gross - fees
+        pnl_pct = (pnl / self.balance) * 100 if self.balance else 0.0
+        self.balance += pnl
+
+        tr = TradeReport(
+            symbol=pos.symbol,
+            strategy=pos.strategy,
+            direction=pos.direction,
+            entry_time=pos.entry_time,
+            entry_price=pos.entry_price,
+            exit_time=ts,
+            exit_price=fill,
+            stop_price=pos.stop_price,
+            target_price=pos.target_price,
+            contracts=pos.contracts,
+            pnl_dollars=pnl,
+            pnl_pct=pnl_pct,
+            fees=fees,
+            exit_reason=reason,
+            status="closed",
+        )
+        self.closed.append(tr)
+        self._persist_trade(tr)
+        del self.positions[pos.symbol]
+        if self.on_trade_closed:
+            try:
+                self.on_trade_closed(tr)
+            except Exception:
+                pass
+
+    # ── Persistence ────────────────────────────────────────────────────
+    def _persist_trade(self, tr: TradeReport) -> None:
+        # SQLite
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            conn.execute("""
+                INSERT INTO trades (symbol, strategy, direction, entry_time, entry_price,
+                                    exit_time, exit_price, stop_price, target_price,
+                                    contracts, pnl_dollars, pnl_pct, fees, exit_reason, status)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (tr.symbol, tr.strategy, tr.direction, tr.entry_time, tr.entry_price,
+                  tr.exit_time, tr.exit_price, tr.stop_price, tr.target_price,
+                  tr.contracts, tr.pnl_dollars, tr.pnl_pct, tr.fees, tr.exit_reason, tr.status))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"[strategy_engine] sqlite write failed: {e}")
+
+        # JSON append
+        try:
+            log = []
+            if os.path.exists(TRADE_LOG_PATH):
+                with open(TRADE_LOG_PATH) as f:
+                    raw = f.read().strip()
+                    if raw:
+                        log = json.loads(raw)
+            log.append(asdict(tr))
+            with open(TRADE_LOG_PATH, "w") as f:
+                json.dump(log, f, indent=2)
+        except Exception as e:
+            print(f"[strategy_engine] json write failed: {e}")
+
+    # ── Reporting ──────────────────────────────────────────────────────
+    def get_session_report(self) -> dict:
+        wins = [t for t in self.closed if t.pnl_dollars > 0]
+        losses = [t for t in self.closed if t.pnl_dollars <= 0]
+        total_pnl = sum(t.pnl_dollars for t in self.closed)
+        return {
+            "balance": self.balance,
+            "starting_balance": self.starting_balance,
+            "total_pnl": total_pnl,
+            "total_pnl_pct": (total_pnl / self.starting_balance * 100) if self.starting_balance else 0.0,
+            "trades": len(self.closed),
+            "wins": len(wins),
+            "losses": len(losses),
+            "win_rate": (len(wins) / len(self.closed) * 100) if self.closed else 0.0,
+            "open_positions": len(self.positions),
+            "risk_mode": self.risk_mode,
+            "enabled_strategies": sorted(self.enabled),
+        }
+
+    def open_positions_summary(self) -> list[dict]:
+        return [
+            {
+                "symbol": p.symbol, "strategy": p.strategy, "direction": p.direction,
+                "entry_price": p.entry_price, "stop": p.stop_price, "target": p.target_price,
+                "contracts": p.contracts, "entry_time": p.entry_time,
+            }
+            for p in self.positions.values()
+        ]
+
+
+# ─── Simple backtest / test harness ─────────────────────────────────────
+def backtest_symbol(symbol: str, timeframe: str = "1d", bars: int = 500) -> dict:
+    """Walk-forward backtest on one symbol. Returns session report."""
+    df = load_bars(symbol, timeframe, bars)
+    if df is None:
+        return {"error": f"no data for {symbol} {timeframe}"}
+
+    eng = StrategyEngine(starting_balance=10_000, risk_mode="moderate")
+    # Walk bar by bar so entries/exits use only past data
+    for i in range(60, len(df)):
+        sub = df.iloc[: i + 1].copy()
+        eng.step(symbol, sub)
+    eng.close_all("end_of_test")
+    return eng.get_session_report()
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Futures paper trading engine")
+    ap.add_argument("--test", action="store_true", help="Run a walk-forward backtest")
+    ap.add_argument("--symbol", default="ES=F")
+    ap.add_argument("--timeframe", default="1d")
+    ap.add_argument("--bars", type=int, default=500)
+    args = ap.parse_args()
+
+    if args.test:
+        print(f"Backtesting {args.symbol} {args.timeframe} ({args.bars} bars)")
+        rep = backtest_symbol(args.symbol, args.timeframe, args.bars)
+        for k, v in rep.items():
+            if isinstance(v, float):
+                print(f"  {k:<22} {v:.2f}")
+            else:
+                print(f"  {k:<22} {v}")
+    else:
+        eng = StrategyEngine()
+        print("Engine initialized. Use --test to run a backtest.")
+        print(f"Risk mode: {eng.risk_mode}")
+        print(f"Enabled strategies: {sorted(eng.enabled)}")
+
+
+if __name__ == "__main__":
+    main()

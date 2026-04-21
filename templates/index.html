@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="theme-color" content="#0d1117">
+    <link rel="manifest" href="/manifest.json">
+    <title>Futures Controller</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <!-- Login screen -->
+    <div id="login-screen" class="login-screen">
+        <div class="login-card">
+            <div class="login-icon">&#x1f4c8;</div>
+            <h1>Futures Controller</h1>
+            <p>Enter your auth token</p>
+            <input type="password" id="token-input" placeholder="Paste token here" autocomplete="off">
+            <button id="login-btn" onclick="doLogin()">Connect</button>
+            <div id="login-error" class="login-error"></div>
+        </div>
+    </div>
+
+    <!-- Main app -->
+    <div id="app" class="app hidden">
+        <header class="header">
+            <div class="header-left">
+                <span class="header-dot" id="conn-dot"></span>
+                <span class="header-title">FUTURES</span>
+                <span id="role-label"></span>
+            </div>
+            <div class="header-prices" id="header-prices"></div>
+            <button class="btn-logout" onclick="doLogout()">Logout</button>
+        </header>
+
+        <main class="main">
+            <!-- Status Tab -->
+            <div class="tab-pane active" id="tab-status">
+                <div class="card">
+                    <div class="card-header">
+                        <span class="card-title">AUTOPILOT</span>
+                        <span class="badge" id="risk-badge">--</span>
+                    </div>
+                    <div class="pnl-big" id="pnl-display">$0.00</div>
+                    <div class="pnl-pct" id="pnl-pct">(0.0%)</div>
+                    <div class="stat-row">
+                        <div class="stat"><span class="stat-label">Balance</span><span class="stat-val" id="balance">$10,000</span></div>
+                        <div class="stat"><span class="stat-label">Trades</span><span class="stat-val" id="total-trades">0</span></div>
+                        <div class="stat"><span class="stat-label">Win Rate</span><span class="stat-val" id="win-rate">0%</span></div>
+                        <div class="stat"><span class="stat-label">Open</span><span class="stat-val" id="open-positions">0</span></div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header"><span class="card-title">LATEST AI DECISION</span></div>
+                    <div id="ai-decision">Loading...</div>
+                    <button class="btn-primary" id="run-ai-btn" onclick="runAutopilotNow()">Run now</button>
+                </div>
+
+                <div class="card">
+                    <div class="card-header"><span class="card-title">NEWS</span></div>
+                    <div id="news-summary">Loading...</div>
+                </div>
+            </div>
+
+            <!-- Prices Tab -->
+            <div class="tab-pane" id="tab-prices">
+                <div class="card">
+                    <div class="card-header"><span class="card-title">LIVE PRICES</span></div>
+                    <table class="table">
+                        <thead><tr><th>Symbol</th><th>Last</th><th>Change</th><th>Updated</th></tr></thead>
+                        <tbody id="prices-tbody"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Chart Tab -->
+            <div class="tab-pane" id="tab-chart">
+                <div class="card">
+                    <div class="chart-controls">
+                        <select id="chart-symbol" onchange="loadChart()"></select>
+                        <select id="chart-timeframe" onchange="loadChart()">
+                            <option value="1d">Daily</option>
+                            <option value="1h" selected>1 hour</option>
+                            <option value="15m">15 min</option>
+                            <option value="5m">5 min</option>
+                            <option value="1m">1 min</option>
+                        </select>
+                    </div>
+                    <canvas id="chart-canvas" width="600" height="400"></canvas>
+                </div>
+            </div>
+
+            <!-- Trades Tab -->
+            <div class="tab-pane" id="tab-trades">
+                <div class="card">
+                    <div class="card-header"><span class="card-title">OPEN POSITIONS</span></div>
+                    <table class="table">
+                        <thead><tr><th>Symbol</th><th>Strat</th><th>Dir</th><th>Entry</th><th>Stop</th><th>Target</th></tr></thead>
+                        <tbody id="open-tbody"><tr><td colspan="6" class="muted">none</td></tr></tbody>
+                    </table>
+                </div>
+                <div class="card">
+                    <div class="card-header"><span class="card-title">CLOSED TRADES</span></div>
+                    <table class="table">
+                        <thead><tr><th>Symbol</th><th>Strat</th><th>Dir</th><th>P&amp;L</th><th>%</th><th>Reason</th></tr></thead>
+                        <tbody id="closed-tbody"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Services Tab -->
+            <div class="tab-pane" id="tab-services">
+                <div class="card">
+                    <div class="card-header"><span class="card-title">SERVICES</span></div>
+                    <div id="services-list">Loading...</div>
+                </div>
+                <div class="card">
+                    <div class="card-header"><span class="card-title">LOG</span></div>
+                    <pre id="log-pane"></pre>
+                </div>
+            </div>
+        </main>
+
+        <!-- Bottom tab bar -->
+        <nav class="tabbar">
+            <button class="tab active" data-tab="status" onclick="switchTab('status')">Status</button>
+            <button class="tab" data-tab="prices" onclick="switchTab('prices')">Prices</button>
+            <button class="tab" data-tab="chart"  onclick="switchTab('chart')">Chart</button>
+            <button class="tab" data-tab="trades" onclick="switchTab('trades')">Trades</button>
+            <button class="tab" data-tab="services" onclick="switchTab('services')">Svcs</button>
+        </nav>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

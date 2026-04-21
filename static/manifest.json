@@ -1,0 +1,14 @@
+{
+    "name": "Futures Controller",
+    "short_name": "Futures",
+    "description": "Control and monitor the futures trading autopilot.",
+    "start_url": "/",
+    "display": "standalone",
+    "background_color": "#0d1117",
+    "theme_color": "#0d1117",
+    "orientation": "portrait",
+    "icons": [
+        { "src": "/static/icon-192.png", "sizes": "192x192", "type": "image/png" },
+        { "src": "/static/icon-512.png", "sizes": "512x512", "type": "image/png" }
+    ]
+}

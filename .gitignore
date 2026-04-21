@@ -27,3 +27,21 @@ venv/
 
 # Session reports
 session_report_*.docx
+
+# Runtime logs
+*.log
+fetch.log
+sync.log
+sync-launchd.log
+autopilot_log.txt
+minimax_insights_log.txt
+
+# Runtime state / caches
+trade_log.json
+news_cache.json
+minimax_insights.json
+
+# Lock files
+*.lock
+.sync.lock.d/
+fetch.lock
