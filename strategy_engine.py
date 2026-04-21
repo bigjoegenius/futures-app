@@ -128,6 +128,7 @@ class StrategyEngine:
         self.closed: list[TradeReport] = []
         self.on_trade_closed = on_trade_closed
         self.min_score_to_enter = 60.0
+        self._last_entry_bar: dict[str, str] = {}
 
     # ── Config ─────────────────────────────────────────────────────────
     def set_risk(self, mode: str) -> None:
@@ -154,15 +155,20 @@ class StrategyEngine:
         low = float(df["low"].iloc[-1])
         now = df["datetime"].iloc[-1].isoformat() if "datetime" in df else datetime.now(timezone.utc).isoformat()
 
-        # First: manage any open position on this symbol
+        # One entry per bar per symbol — without this, a 5-min step loop over
+        # 1h bars re-opens identical trades when the bar already bracketed the target.
+        is_new_bar = self._last_entry_bar.get(symbol) != now
+
         pos = self.positions.get(symbol)
         if pos is not None:
             self._manage_position(pos, high, low, last, now, spec)
-            # Re-check; if still open, don't open a second one
             if symbol in self.positions:
                 return
 
-        # Second: look for entries among enabled strategies
+        if not is_new_bar:
+            return
+        self._last_entry_bar[symbol] = now
+
         scores = score_strategies(symbol, df, tf=timeframe, strategy_filter=self.enabled)
         candidates = []
         for sid, info in scores.items():

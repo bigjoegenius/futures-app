@@ -337,6 +337,66 @@ cd ~/futures-app && python3 backtest_all.py > backtests/session_run.log 2>&1 &
 - Read `session_breakdown_*.json` to decide whether to restrict the
   autopilot to US RTH hours only (via a session guard in `StrategyWorker`).
 
+### Session log — 2026-04-21 (Duplicate-trade bug fix)
+
+**Symptom:** Futures dashboard showed the same `macd_momentum` SHORT
+trade replaying 9–12x with identical entry/exit prices, timestamps,
+and P&L. `trades` table held 172 closed rows but only 58 unique by
+(symbol, strategy, entry_time, entry_price, exit_time, exit_price, pnl).
+
+**Root cause** — `strategy_engine.step()`: `StrategyWorker` runs
+`engine.step()` every 5 minutes but loads 1h bars. When a bar's
+range already bracketed both entry price and target, the flow was:
+  - step N:   no position → `_open_position` opens on bar X close
+  - step N+1: `_manage_position` sees `bar.low ≤ target` → closes
+              at target → falls through to entry check → same bar,
+              same indicators, same signal → opens again
+  - repeat 10–12x per hour until a new 1h bar forms.
+
+Each close called `_persist_trade` (a plain INSERT, no dedup
+guard), so the DB piled up identical rows.
+
+**Fix** — one entry per bar per symbol:
+- Added `_last_entry_bar: dict[str, str]` on `StrategyEngine`.
+- `step()` still manages open positions on every call (so
+  stops/targets fire promptly), but the entry scan now only runs
+  when the latest bar's timestamp differs from the one last
+  processed for that symbol.
+- Safe for both live (`StrategyWorker`) and backtest (`backtest_symbol`
+  iterates bar-by-bar, so each sub-frame has a fresh last bar).
+
+**Crypto-app same class** — mitigated but not immune. `crypto-app`'s
+`_close_trade` already set a 6-bar cooldown on STOP but none on
+TARGET, so a `check_exit` that hit target followed by `check_entry`
+could re-enter in the same call. Extended the cooldown block to set
+a 1-bar cooldown on TARGET exits too. In practice crypto-app's
+entry conditions (EMA crossovers against prior-bar values, RSI+BB
+combos) rarely re-fire mid-bar — the DB had 62/62 unique closed
+trades — so this is a belt-and-suspenders guard.
+
+**Deployment (completed this session):**
+  1. Stopped `futures-autopilot` + `futures-static` on adamserver
+     to freeze the DB.
+  2. Backed up `/home/joe/futures-app/futures.db` to
+     `futures.db.backup-20260421-220549` (104MB).
+  3. `scp` fixed `strategy_engine.py` to
+     `adamserver:/home/joe/futures-app/` AND
+     `adamserver:/home/joe/crypto-app/`.
+  4. One-shot dedup on futures.db:
+     ```sql
+     DELETE FROM trades WHERE status='closed' AND id NOT IN (
+       SELECT MIN(id) FROM trades WHERE status='closed'
+       GROUP BY symbol, strategy, entry_time, entry_price,
+                exit_time, exit_price, pnl_dollars);
+     ```
+     Result: 172 → 64 closed rows.
+  5. Restarted `futures-autopilot`, `futures-static`,
+     `crypto-autopilot` — all active.
+
+**Recovery path:** pre-dedup backup lives at
+`adamserver:/home/joe/futures-app/futures.db.backup-20260421-220549`.
+Safe to delete once the fix has run clean for a day or two.
+
 ## Working style notes
 - Joe is a beginner — explain everything in plain English
 - Walk through commands one at a time
