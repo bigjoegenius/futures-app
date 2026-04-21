@@ -18,6 +18,12 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+except Exception:
+    pass
 import threading
 import time
 from datetime import datetime, timezone
@@ -45,7 +51,7 @@ class AutoPilot:
         self._thread: Optional[threading.Thread] = None
         self.last_decision: Optional[dict] = None
         self.ai_calls = 0
-        self.model_name = "claude-opus-4-6"
+        self.model_name = "claude-opus-4-7"
 
     # ── Lifecycle ──────────────────────────────────────────────────────
     def start(self) -> None:
@@ -103,7 +109,7 @@ class AutoPilot:
         try:
             msg = client.messages.create(
                 model=self.model_name,
-                max_tokens=800,
+                max_tokens=2500,
                 messages=[{"role": "user", "content": prompt}],
             )
             self.ai_calls += 1
@@ -117,14 +123,21 @@ class AutoPilot:
         for sym, info in overview.items():
             if "error" in info:
                 continue
+            # Keep only strategies with nonzero scores for context brevity
+            top_strats = {
+                sid: {"direction": s["direction"], "score": round(s["score"], 1), "note": s["note"]}
+                for sid, s in info.get("strategies", {}).items()
+                if s.get("score", 0) > 0
+            }
+            ind = info.get("indicators", {})
             snap[sym] = {
                 "name": info.get("name"),
-                "last": info.get("last"),
-                "change_24h_pct": info.get("change_24h_pct"),
-                "strategies": {
-                    sid: {"direction": s["direction"], "score": s["score"], "note": s["note"]}
-                    for sid, s in info.get("strategies", {}).items()
-                },
+                "last": round(info.get("last", 0), 4),
+                "change_24h_pct": round(info.get("change_24h_pct", 0), 2),
+                "rsi": round(ind.get("rsi", 50), 1) if ind else None,
+                "bb_pct": round((ind.get("close", 0) - ind.get("bb_lower", 0)) /
+                                 max(ind.get("bb_upper", 1) - ind.get("bb_lower", 0), 1e-9), 2) if ind else None,
+                "strategies": top_strats,
             }
         trade_rows = []
         for t in trades_tail:
@@ -134,14 +147,17 @@ class AutoPilot:
             })
 
         strategy_catalog = "\n".join(
-            f"- {sid}: {STRATEGIES[sid]['description']}" for sid in CONTROLLABLE_STRATEGIES
+            f"- {sid} ({STRATEGIES[sid].get('direction','BOTH')} on {','.join(STRATEGIES[sid].get('markets',['all']))[:60]}): "
+            f"{STRATEGIES[sid]['description']}"
+            for sid in CONTROLLABLE_STRATEGIES
         )
 
         session = self.engine.get_session_report()
 
-        return f"""You are the autopilot for a US futures day-trading / swing paper account.
+        return f"""You are the autopilot AI for a US futures day-trading / swing paper account spanning 18 contracts
+(indexes ES/NQ/YM/RTY · energy CL/NG · metals GC/SI/HG · bonds ZB/ZN · grains ZC/ZS/ZW · softs KC/SB/CT · cattle LE).
 
-Available strategies (you can enable any subset):
+Available strategies ({len(CONTROLLABLE_STRATEGIES)} total — enable any subset):
 {strategy_catalog}
 
 Current session state:
@@ -149,19 +165,51 @@ Current session state:
 - total pnl pct: {session['total_pnl_pct']:.2f}%
 - trades: {session['trades']}  win rate: {session['win_rate']:.1f}%
 - risk_mode: {session['risk_mode']}
+- open positions: {session['open_positions']}
 
-Market snapshot (score 0-100 for each strategy per contract):
-{json.dumps(snap, indent=2)[:5000]}
+Market snapshot (only strategies with score > 0 shown per symbol):
+{json.dumps(snap, indent=2)[:6500]}
 
 Recent closed trades:
 {json.dumps(trade_rows, indent=2)[:1500]}
 
-Choose:
-  1. Which of the {len(CONTROLLABLE_STRATEGIES)} strategies to enable for the next cycle.
-  2. A risk_mode out of ["conservative", "moderate", "aggressive"].
-  3. A brief (<120 word) reasoning explaining why.
+Decide:
+  1. strategies.<name>.enable: true/false, strategies.<name>.confidence: 0-100, strategies.<name>.reason: one sentence
+  2. risk_mode: "conservative" | "moderate" | "aggressive"
+  3. overall_confidence: 0-100
+  4. summary: 1-2 sentence market outlook
+  5. high_conviction_trade: if a single setup stands out, include it (symbol, strategy, direction, entry_price, stop_loss, take_profit, confidence_pct, reasoning)
 
-Return ONLY a JSON object, no markdown, exactly this shape:
+Rules of thumb:
+- Macro events (FOMC, WASDE, EIA): prefer to stay flat until resolution unless confidence is very high
+- Index ORB strategies only make sense during US RTH (09:30-16:00 ET)
+- Grain strategies favor Sep/Oct for seasonal_harvest, and the day of WASDE for wasde_react
+- Bond strategies favor the 3 days after FOMC
+- If a strategy has lost 3 straight in recent trades, disable it for 1 cycle
+
+Return ONLY a JSON object, no markdown. Exact shape:
+{{
+  "strategies": {{
+    "ema_cross": {{"enable": true, "confidence": 65, "reason": "..."}},
+    ...
+  }},
+  "risk_mode": "moderate",
+  "overall_confidence": 72,
+  "summary": "...",
+  "high_conviction_trade": {{
+    "exists": false,
+    "symbol": "",
+    "strategy": "",
+    "direction": "LONG",
+    "entry_price": "",
+    "stop_loss": "",
+    "take_profit": "",
+    "confidence_pct": 0,
+    "reasoning": ""
+  }}
+}}
+
+Fallback: if you don't want to use the full JSON shape, the legacy form also works:
 {{"enabled": ["ema_cross", "macd_momentum"], "risk_mode": "moderate", "reasoning": "..."}}
 """
 
@@ -175,16 +223,39 @@ Return ONLY a JSON object, no markdown, exactly this shape:
         except json.JSONDecodeError:
             return self._local_decision(overview, reason="AI JSON parse failed")
 
-        enabled = [s for s in raw.get("enabled", []) if s in CONTROLLABLE_STRATEGIES]
+        # New format: strategies.<name>.enable + confidence
+        enabled = []
+        strategy_confidences = {}
+        strats_obj = raw.get("strategies") or {}
+        if isinstance(strats_obj, dict) and strats_obj:
+            for sid, info in strats_obj.items():
+                if sid not in CONTROLLABLE_STRATEGIES or not isinstance(info, dict):
+                    continue
+                if info.get("enable"):
+                    enabled.append(sid)
+                strategy_confidences[sid] = {
+                    "confidence": int(info.get("confidence", 0) or 0),
+                    "reason": str(info.get("reason", ""))[:300],
+                    "enabled": bool(info.get("enable")),
+                }
+        else:
+            # Legacy format: {"enabled": [...]}
+            enabled = [s for s in raw.get("enabled", []) if s in CONTROLLABLE_STRATEGIES]
+
         risk = raw.get("risk_mode", "moderate")
         if risk not in RISK_MODES:
             risk = "moderate"
         if not enabled:
             enabled = list(DEFAULT_STRATEGIES)
+
         return {
             "enabled": enabled,
             "risk_mode": risk,
-            "reasoning": raw.get("reasoning", "")[:1000],
+            "reasoning": (raw.get("reasoning") or raw.get("summary") or "")[:1000],
+            "overall_confidence": int(raw.get("overall_confidence", 0) or 0),
+            "summary": str(raw.get("summary", ""))[:500],
+            "strategy_confidences": strategy_confidences,
+            "high_conviction_trade": raw.get("high_conviction_trade") or {"exists": False},
             "source": "claude",
             "ts": datetime.now(timezone.utc).isoformat(),
         }

@@ -3,7 +3,7 @@
 # Runs hourly via launchd (see ~/Library/LaunchAgents/com.joe.futures-sync.plist).
 
 set -u
-LOCAL_DIR="$HOME/futures-app"
+LOCAL_DIR="$HOME/trading/futures-app"
 LOG="$LOCAL_DIR/sync.log"
 LOCK_DIR="$LOCAL_DIR/.sync.lock.d"
 REMOTE="adamserver:/home/joe/futures-app/futures.db"

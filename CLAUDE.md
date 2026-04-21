@@ -43,7 +43,7 @@ Apex Trading (futures)
 - UI: CustomTkinter
 
 ## Project folder
-~/futures-app (located at /Users/joethieme/futures-app)
+~/trading/futures-app (located at /Users/joethieme/trading/futures-app)
 
 ## Mac setup status
 - Python 3.14.3 installed ✅
@@ -193,6 +193,149 @@ Automated 24/7 data collection running on adamserver with sync back to Mac.
 ### Phase 5 — Apex Trading integration (NOT STARTED)
 Paper trading only for now. No broker module. When ready, add `broker.py` with a
 clean place_order / close_position interface and wire it from strategy_engine.py.
+
+### Phase 6 — 28-Strategy catalog + live Autopilot + Static deploy (2026-04-21) ✅
+Expanded from 6 to 28 strategies, backtested, deployed on adamserver.
+
+**Files created/updated:**
+- `strategies/STRATEGY_CATALOG.md` — full 28-strategy reference (rules, markets, timeframes, sources)
+- `market_analyzer.py` — rewritten with 28 strategies + VWAP/Keltner/Donchian helpers + dispatcher
+- `strategy_engine.py` — per-strategy stop/target multipliers, `backtest_symbol` returns trade detail
+- `news_fixtures.json` — FOMC/WASDE/EIA/OPEC dates + major market events for overlay
+- `backtest_all.py` — walk-forward all (strategy × market × tf) combos, writes DB + per-combo JSON + equity PNG
+- `build_strategy_report.py` — Word doc generator with DB + JSON fallback
+- `autopilot.py` — upgraded to `claude-opus-4-7`, richer prompt (28 strategies), proper JSON schema parsing
+- `minimax_insights.py` — full dual-model rewrite (M2.7 deep + M2.5 structured JSON signals)
+- `run_autopilot.py` — dual-portfolio support (`--portfolio autopilot|static_all`), per-trade emails (open + close),
+  wrapped `_open_position` for on-open callback, all emails to `baldwetcoby@gmail.com`
+
+**Strategies (28 total):**
+- Market-agnostic (10): ema_cross, macd_momentum, rsi_extreme, bb_breakout, volume_breakout,
+  triple_confluence, donchian_20, donchian_55, keltner_squeeze, gap_fade
+- Index specialists (4 — ES/NQ/YM/RTY): orb_15, vwap_pullback, overnight_gap, rth_reversal
+- Energy specialists (2 — CL/NG): eia_fade, asia_london_breakout
+- Metals specialists (2 — GC/SI/HG): gold_silver_ratio, copper_risk_on
+- Bond specialists (2 — ZB/ZN): fomc_drift, steepener
+- Grain specialists (2 — ZC/ZS/ZW): wasde_react, seasonal_harvest
+- Softs + cattle (4 — KC/SB/CT/LE): coffee_weather_spike, sugar_carry, cotton_mean_rev, cattle_cot_long
+- Extras (2 — all): range_reversal, breakout_retest
+
+**Backtest (~488 combos):** Initial partial run (70 combos done at report time) validated the harness.
+Top early combo: `ema_cross` × ES/GC/NQ on 1d delivers $10k+ P&L over ~1500 bars (4+ years daily).
+Losing trades get news-tagged when they overlap FOMC/WASDE/OPEC/major events (±4h window).
+
+**adamserver deployment:**
+- Services added (all ENABLED + ACTIVE on 2026-04-21):
+  - `futures-autopilot.service` — run_autopilot.py --portfolio autopilot (Claude-gated)
+  - `futures-static.service` — run_autopilot.py --portfolio static_all (all 28 always on)
+  - `futures-minimax.service` — minimax_insights.py --loop (10-min M2.7+M2.5)
+  - `futures-live-prices.service` — live_prices.py (30s poller)
+  - All point at `/home/joe/crypto-app/venv/bin/python3` (reused crypto venv with anthropic/docx/etc)
+  - EnvironmentFile=`/home/joe/futures-app/.env` loads ANTHROPIC_API_KEY, MINIMAX_API_KEY, GMAIL creds,
+    and BALDWETCOBY_EMAIL_TO=baldwetcoby@gmail.com
+- Email setup: per-trade (open + close) + daily recap at 4pm ET → `baldwetcoby@gmail.com`
+  Subject tags `[FUTURES AUTOPILOT]` / `[FUTURES STATIC]` / `[FUTURES DAILY]` for Gmail filters
+
+**Unified web UI (crypto-app web_controller + public_viewer):**
+- Mode toggle pill at top: Crypto / Futures
+- `web_controller.py` — new `/api/futures/{status, services, prices, trades, paper, db, ai-overview, health,
+   log, server, calendar, trade-candles, news-digest}` routes, all reading `~/futures-app/futures.db`
+- `public_viewer.py` — new `/api/futures/{markets, summary, trades, strategies}` routes with plain-English
+   explanations for all 28 strategies
+- `static/app.js` — MODE state, mode-aware apiFetch, header price chip adapts to futures symbols
+- `static/style.css` — `.mode-switch`, `.mode-btn` styles
+- `static/sw.js` — cache bumped to `crypto-ctrl-v2`
+- `static/public_viewer.js` + `public_viewer.css` + `templates/public_viewer.html` — mirror toggle
+
+**Deliverable:** `~/Desktop/Futures_Strategy_Report_2026-04-21.docx` — cover, top-15 winners,
+worst 10, contract specs, per-strategy deep dive (1 page each with equity curve + news-tagged losses),
+per-market recommendations, "News That Hurt Us" section.
+
+**How to continue the backtest** (if partial):
+```
+cd ~/futures-app && python3 -u backtest_all.py > backtests/run_log.txt 2>&1 &
+# Once done:
+python3 build_strategy_report.py --open   # regenerates Word doc on Desktop
+```
+
+**Email volume expectation:** static engine with all 28 strategies always-on will generate
+significantly more emails than autopilot (estimated 15-30/day during active sessions vs 5/day for autopilot).
+Both stamped with the appropriate tag so Gmail filters can sort them.
+
+**Known caveats:**
+- 1m data = 8 days, 5m/15m = ~60 days (yfinance limits). Backtests on those timeframes are low-sample.
+- `cattle_cot_long` uses a price+volume proxy since CoT report data isn't in futures.db.
+- `sugar_carry` uses a 20-day trend + end-of-month proxy instead of true contango term structure.
+- News fixtures are baked-in calendar events; doesn't cover every headline.
+
+### Phase 7 — Apex Trading integration (NOT STARTED)
+Same as Phase 5 above — build `broker.py` and wire into `strategy_engine.py` when ready.
+
+### Phase 6b — Confidence scoring + email overhaul (2026-04-21) ✅
+Every trade now carries a 0-100 confidence score; per-trade spam replaced by
+top-5% rolling alert. Everything routes to `baldwetcoby@gmail.com`.
+
+**Files created/updated:**
+- `confidence_tracker.py` — NEW. Rolling percentile tracker (last 200 closed
+  trades' confidence), persisted to `confidence_window.json`. Cold-start
+  fallback: confidence ≥ 85 triggers until the window has 50+ samples.
+- `strategy_engine.py` — `TradeReport` and `Position` gained `confidence` +
+  `confidence_source` fields. New `_estimate_confidence()` blends raw
+  strategy score (50%) + MiniMax per-strategy score (30%) + MiniMax overall
+  confidence aligned with direction (20%). `_open_position()` now takes a
+  `raw_score` kwarg and stores the blended confidence on the Position.
+- `db_setup.py` — `trades` table gets `confidence REAL` + `confidence_source
+  TEXT`. Old-deployment safe via `ALTER TABLE ADD COLUMN`.
+- `run_autopilot.py` — per-trade OPEN/CLOSE emails REMOVED. New
+  `_send_high_conviction_alert()` fires only when a trade opens with
+  confidence ≥ 95th percentile of the rolling window (subject tag
+  `[FUTURES HIGH CONVICTION]`). `on_trade_closed` records confidence into the
+  window. Daily 4pm ET recap now shows the percentile cut + confidence column
+  in recent trades. Subject tag changed to `[FUTURES DAILY]` for the recap.
+  Startup seeds the tracker from prior closed trades in the SQLite `trades`
+  table.
+- `backtest_all.py` — every trade tagged with session bucket
+  (`Asia`/`London`/`US_PreOpen`/`US_RTH`/`US_Post`/`Weekend`). End-of-run
+  prints per-session WR/P&L/avg and writes
+  `backtests/session_breakdown_<run_id>.json`.
+
+**Email volume impact:**
+- Before: ~150 per-trade + 1 daily recap = ~151/day
+- After: 1 daily recap + 0-5 high-conviction alerts = **~1-6/day**
+- Single inbox: `baldwetcoby@gmail.com` for everything
+
+**Confidence blend formula:**
+```
+confidence = 0.5 * raw_strategy_score
+           + 0.3 * minimax_strategy_score     (if present)
+           + 0.2 * minimax_overall_confidence (flipped if direction opposes bias)
+weights renormalise if MiniMax data absent (stub key → raw-only)
+```
+
+**Session buckets (ET, weekday):**
+- US_RTH     09:00-16:00  — main liquidity window
+- US_PreOpen 08:00-09:00
+- US_Post    16:00-18:00  — post-close thin book
+- London     03:00-08:00
+- Asia       18:00-03:00  (wraps midnight)
+- Weekend    Sat/Sun any hour — flags test artefacts
+
+**Confidence field wiring:**
+- `Position.confidence/_source` → `TradeReport.confidence/_source` →
+  `trades` table columns → `trade_log.json` entries → rolling window →
+  daily recap body.
+
+**How to run the session-aware backtest:**
+```
+cd ~/futures-app && python3 backtest_all.py > backtests/session_run.log 2>&1 &
+# Table prints at end of run; JSON at backtests/session_breakdown_<run_id>.json
+```
+
+**Next steps:**
+- Let the rolling window accumulate 50+ real trades (1-2 days) before the
+  percentile gate switches from cold-start cutoff (85) to true top-5%.
+- Read `session_breakdown_*.json` to decide whether to restrict the
+  autopilot to US RTH hours only (via a session guard in `StrategyWorker`).
 
 ## Working style notes
 - Joe is a beginner — explain everything in plain English

@@ -30,7 +30,7 @@ import numpy as np
 import pandas as pd
 
 from futures_config import DB_PATH, FUTURES
-from market_analyzer import score_strategies, load_bars, atr
+from market_analyzer import score_strategies, load_bars, atr, STRATEGIES
 
 
 TRADE_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trade_log.json")
@@ -69,10 +69,8 @@ FEE_PER_CONTRACT_PER_SIDE = 2.50   # $ per contract, per open or close
 SLIPPAGE_TICKS            = 1       # extra ticks against you on fill
 
 RISK_MODES = {"conservative": 0.005, "moderate": 0.01, "aggressive": 0.02}
-DEFAULT_STRATEGIES = list({
-    "ema_cross", "macd_momentum", "rsi_extreme",
-    "bb_breakout", "volume_breakout", "triple_confluence",
-})
+# All 28 strategies from market_analyzer.STRATEGIES catalog
+DEFAULT_STRATEGIES = list(STRATEGIES.keys())
 
 
 @dataclass
@@ -92,6 +90,11 @@ class TradeReport:
     fees: float = 0.0
     exit_reason: Optional[str] = None
     status: str = "open"
+    # 0-100 probability this trade hits TP before SL; blended from raw
+    # strategy score + live MiniMax per-strategy score + MiniMax overall
+    # bias alignment. Populated at open; preserved through close.
+    confidence: Optional[float] = None
+    confidence_source: str = ""
 
 
 @dataclass
@@ -105,6 +108,8 @@ class Position:
     contracts: float
     entry_time: str
     atr_at_entry: float
+    confidence: Optional[float] = None
+    confidence_source: str = ""
 
 
 class StrategyEngine:
@@ -136,7 +141,7 @@ class StrategyEngine:
         self.enabled.discard(strategy)
 
     # ── Core loop ──────────────────────────────────────────────────────
-    def step(self, symbol: str, df: pd.DataFrame) -> None:
+    def step(self, symbol: str, df: pd.DataFrame, timeframe: str = "1h") -> None:
         """Run one tick of the engine for one symbol."""
         if df is None or len(df) < 60:
             return
@@ -158,7 +163,7 @@ class StrategyEngine:
                 return
 
         # Second: look for entries among enabled strategies
-        scores = score_strategies(symbol, df)
+        scores = score_strategies(symbol, df, tf=timeframe, strategy_filter=self.enabled)
         candidates = []
         for sid, info in scores.items():
             if sid not in self.enabled:
@@ -176,12 +181,83 @@ class StrategyEngine:
         candidates.sort(key=lambda kv: kv[1]["score"], reverse=True)
         sid, info = candidates[0]
         atr_val = float(info["signals"].get("atr", max(last * 0.01, spec["tick"] * 4)))
-        self._open_position(symbol, sid, info["direction"].lower(), last, atr_val, now, spec)
+        raw_score = float(info.get("score", 0.0))
+        self._open_position(symbol, sid, info["direction"].lower(), last, atr_val, now, spec,
+                            raw_score=raw_score)
+
+    # ── Confidence estimation ─────────────────────────────────────────
+    def _estimate_confidence(self, strategy: str, direction: str,
+                             raw_score: float) -> tuple[Optional[float], str]:
+        """
+        Blend raw strategy score with live MiniMax signals to produce a
+        0-100 probability-of-success estimate.
+
+          50%  raw strategy score (already 0-100)
+          30%  MiniMax per-strategy score (if strategy is in MiniMax JSON)
+          20%  MiniMax overall confidence, flipped when direction opposes bias
+
+        Source labels describe which inputs were available.
+        """
+        if raw_score is None:
+            return None, ""
+        raw = max(0.0, min(100.0, float(raw_score)))
+
+        mm_strat_score = None
+        mm_overall = None
+        mm_bias = None
+        try:
+            mm_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "minimax_insights.json")
+            if os.path.exists(mm_path):
+                with open(mm_path, "r") as f:
+                    mm = json.load(f)
+                sig = mm.get("structured_signals", {}) or {}
+                mm_overall = sig.get("confidence")
+                mm_bias = str(sig.get("overall_bias", "")).upper()
+                strategies = sig.get("strategies", {}) or {}
+                entry = strategies.get(strategy)
+                if isinstance(entry, dict):
+                    mm_strat_score = entry.get("score")
+                elif isinstance(entry, (int, float)):
+                    mm_strat_score = entry
+        except Exception:
+            pass
+
+        try:
+            mm_strat_score = float(mm_strat_score) if mm_strat_score is not None else None
+        except (TypeError, ValueError):
+            mm_strat_score = None
+        try:
+            mm_overall = float(mm_overall) if mm_overall is not None else None
+        except (TypeError, ValueError):
+            mm_overall = None
+
+        parts = [("raw", raw, 0.5)]
+        if mm_strat_score is not None:
+            parts.append(("mm_strat", max(0.0, min(100.0, mm_strat_score)), 0.3))
+        if mm_overall is not None:
+            aligned = max(0.0, min(100.0, mm_overall))
+            if mm_bias == "BULLISH" and direction.lower() == "short":
+                aligned = 100.0 - aligned
+            elif mm_bias == "BEARISH" and direction.lower() == "long":
+                aligned = 100.0 - aligned
+            parts.append(("mm_overall", aligned, 0.2))
+
+        total_w = sum(w for _, _, w in parts)
+        blended = sum(v * w for _, v, w in parts) / total_w
+        blended = max(0.0, min(100.0, round(blended, 1)))
+        source = "+".join(name for name, _, _ in parts)
+        return blended, source
 
     # ── Position management ────────────────────────────────────────────
-    def _open_position(self, symbol, strategy, direction, price, atr_val, ts, spec):
-        stop_dist = max(atr_val * 1.2, spec["tick"] * 8)
-        target_dist = stop_dist * 1.8
+    def _open_position(self, symbol, strategy, direction, price, atr_val, ts, spec,
+                        *, raw_score: float = 0.0):
+        # Per-strategy stop/target multipliers (fall back to 1.2/1.8)
+        scfg = STRATEGIES.get(strategy, {})
+        stop_mult = float(scfg.get("stop_atr_mult", 1.2))
+        target_mult = float(scfg.get("target_atr_mult", 1.8))
+        stop_dist = max(atr_val * stop_mult, spec["tick"] * 8)
+        target_dist = atr_val * target_mult if target_mult >= 1.0 else stop_dist * target_mult
         if direction == "long":
             stop = price - stop_dist
             target = price + target_dist
@@ -202,6 +278,8 @@ class StrategyEngine:
         slip = SLIPPAGE_TICKS * spec["tick"]
         fill_price = price + slip if direction == "long" else price - slip
 
+        confidence, conf_source = self._estimate_confidence(strategy, direction, raw_score)
+
         self.positions[symbol] = Position(
             symbol=symbol,
             strategy=strategy,
@@ -212,6 +290,8 @@ class StrategyEngine:
             contracts=contracts,
             entry_time=ts,
             atr_at_entry=atr_val,
+            confidence=confidence,
+            confidence_source=conf_source,
         )
 
     def _manage_position(self, pos: Position, bar_high, bar_low, bar_close, ts, spec):
@@ -270,6 +350,8 @@ class StrategyEngine:
             fees=fees,
             exit_reason=reason,
             status="closed",
+            confidence=pos.confidence,
+            confidence_source=pos.confidence_source,
         )
         self.closed.append(tr)
         self._persist_trade(tr)
@@ -285,14 +367,25 @@ class StrategyEngine:
         # SQLite
         try:
             conn = sqlite3.connect(DB_PATH)
+            # Tolerate older schemas that don't yet have the confidence columns.
+            try:
+                conn.execute("ALTER TABLE trades ADD COLUMN confidence REAL")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute("ALTER TABLE trades ADD COLUMN confidence_source TEXT")
+            except sqlite3.OperationalError:
+                pass
             conn.execute("""
                 INSERT INTO trades (symbol, strategy, direction, entry_time, entry_price,
                                     exit_time, exit_price, stop_price, target_price,
-                                    contracts, pnl_dollars, pnl_pct, fees, exit_reason, status)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                                    contracts, pnl_dollars, pnl_pct, fees, exit_reason, status,
+                                    confidence, confidence_source)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (tr.symbol, tr.strategy, tr.direction, tr.entry_time, tr.entry_price,
                   tr.exit_time, tr.exit_price, tr.stop_price, tr.target_price,
-                  tr.contracts, tr.pnl_dollars, tr.pnl_pct, tr.fees, tr.exit_reason, tr.status))
+                  tr.contracts, tr.pnl_dollars, tr.pnl_pct, tr.fees, tr.exit_reason, tr.status,
+                  tr.confidence, tr.confidence_source))
             conn.commit()
             conn.close()
         except Exception as e:
@@ -343,19 +436,28 @@ class StrategyEngine:
 
 
 # ─── Simple backtest / test harness ─────────────────────────────────────
-def backtest_symbol(symbol: str, timeframe: str = "1d", bars: int = 500) -> dict:
-    """Walk-forward backtest on one symbol. Returns session report."""
+def backtest_symbol(symbol: str, timeframe: str = "1d", bars: int = 500,
+                    strategies: list[str] | None = None,
+                    starting_balance: float = 10_000.0,
+                    risk_mode: str = "moderate") -> dict:
+    """Walk-forward backtest on one symbol. Returns session report + trade list."""
     df = load_bars(symbol, timeframe, bars)
     if df is None:
         return {"error": f"no data for {symbol} {timeframe}"}
 
-    eng = StrategyEngine(starting_balance=10_000, risk_mode="moderate")
+    eng = StrategyEngine(
+        starting_balance=starting_balance,
+        risk_mode=risk_mode,
+        enabled_strategies=strategies,
+    )
     # Walk bar by bar so entries/exits use only past data
     for i in range(60, len(df)):
         sub = df.iloc[: i + 1].copy()
-        eng.step(symbol, sub)
+        eng.step(symbol, sub, timeframe=timeframe)
     eng.close_all("end_of_test")
-    return eng.get_session_report()
+    rep = eng.get_session_report()
+    rep["trades_detail"] = [asdict(t) for t in eng.closed]
+    return rep
 
 
 def main():

@@ -982,7 +982,7 @@ class Dashboard(ctk.CTk):
             result = subprocess.run(
                 ["python3", "fetch_data.py", "--all"],
                 capture_output=True, text=True,
-                cwd="/Users/joethieme/futures-app"
+                cwd="/Users/joethieme/trading/futures-app"
             )
             # Back on main thread
             self.after(0, self._on_refresh_done, result.returncode)

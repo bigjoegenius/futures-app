@@ -40,8 +40,15 @@ minimax_insights_log.txt
 trade_log.json
 news_cache.json
 minimax_insights.json
+confidence_window.json
+
+# Backtest artifacts (thousands of JSON/PNG files)
+backtests/
 
 # Lock files
 *.lock
 .sync.lock.d/
 fetch.lock
+
+# Claude Code worktrees
+.claude/

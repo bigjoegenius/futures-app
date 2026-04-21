@@ -69,24 +69,33 @@ def create_database():
     # Closed paper trades
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS trades (
-            id             INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol         TEXT NOT NULL,
-            strategy       TEXT NOT NULL,
-            direction      TEXT NOT NULL,       -- "long" or "short"
-            entry_time     TEXT NOT NULL,
-            entry_price    REAL NOT NULL,
-            exit_time      TEXT,
-            exit_price     REAL,
-            stop_price     REAL,
-            target_price   REAL,
-            contracts      REAL NOT NULL,
-            pnl_dollars    REAL,
-            pnl_pct        REAL,
-            fees           REAL,
-            exit_reason    TEXT,
-            status         TEXT NOT NULL        -- "open" or "closed"
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol             TEXT NOT NULL,
+            strategy           TEXT NOT NULL,
+            direction          TEXT NOT NULL,       -- "long" or "short"
+            entry_time         TEXT NOT NULL,
+            entry_price        REAL NOT NULL,
+            exit_time          TEXT,
+            exit_price         REAL,
+            stop_price         REAL,
+            target_price       REAL,
+            contracts          REAL NOT NULL,
+            pnl_dollars        REAL,
+            pnl_pct            REAL,
+            fees               REAL,
+            exit_reason        TEXT,
+            status             TEXT NOT NULL,       -- "open" or "closed"
+            confidence         REAL,                -- 0-100 probability this trade wins
+            confidence_source  TEXT                 -- which signals went into the blend
         )
     """)
+
+    # Older deploys may have a pre-confidence schema; add the columns if missing.
+    for col, col_type in (("confidence", "REAL"), ("confidence_source", "TEXT")):
+        try:
+            cursor.execute(f"ALTER TABLE trades ADD COLUMN {col} {col_type}")
+        except sqlite3.OperationalError:
+            pass
 
     cursor.execute("""
         CREATE INDEX IF NOT EXISTS idx_trades_status

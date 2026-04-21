@@ -1,0 +1,63 @@
+{
+  "_description": "Economic/news event fixtures for futures strategy triggers and news-overlay of losing trades. All times Eastern. Dates YYYY-MM-DD. Sourced from public Federal Reserve, EIA, USDA, and BLS historical calendars.",
+  "fomc_dates": [
+    "2023-01-31", "2023-02-01", "2023-03-21", "2023-03-22", "2023-05-02", "2023-05-03",
+    "2023-06-13", "2023-06-14", "2023-07-25", "2023-07-26", "2023-09-19", "2023-09-20",
+    "2023-10-31", "2023-11-01", "2023-12-12", "2023-12-13",
+    "2024-01-30", "2024-01-31", "2024-03-19", "2024-03-20", "2024-04-30", "2024-05-01",
+    "2024-06-11", "2024-06-12", "2024-07-30", "2024-07-31", "2024-09-17", "2024-09-18",
+    "2024-11-06", "2024-11-07", "2024-12-17", "2024-12-18",
+    "2025-01-28", "2025-01-29", "2025-03-18", "2025-03-19", "2025-04-29", "2025-04-30",
+    "2025-06-17", "2025-06-18", "2025-07-29", "2025-07-30", "2025-09-16", "2025-09-17",
+    "2025-10-28", "2025-10-29", "2025-12-09", "2025-12-10",
+    "2026-01-27", "2026-01-28", "2026-03-17", "2026-03-18", "2026-04-28", "2026-04-29"
+  ],
+  "eia_crude_wednesdays": {
+    "_comment": "EIA Petroleum Status Report released 10:30 ET Wednesdays (or Thursday after holiday). We just check day_of_week==2 (Wed) at 10:30 ET in the strategy; this list is for back-reference and news overlay.",
+    "2026_sample": ["2026-01-07", "2026-01-14", "2026-01-21", "2026-01-28", "2026-02-04", "2026-02-11", "2026-02-18", "2026-02-25", "2026-03-04", "2026-03-11", "2026-03-18", "2026-03-25", "2026-04-01", "2026-04-08", "2026-04-15"]
+  },
+  "eia_natgas_thursdays": {
+    "_comment": "EIA Natural Gas Storage Report 10:30 ET Thursdays.",
+    "2026_sample": ["2026-01-08", "2026-01-15", "2026-01-22", "2026-01-29", "2026-02-05", "2026-02-12", "2026-02-19", "2026-02-26", "2026-03-05", "2026-03-12", "2026-03-19", "2026-03-26", "2026-04-02", "2026-04-09", "2026-04-16"]
+  },
+  "wasde_dates": [
+    "2023-01-12", "2023-02-08", "2023-03-08", "2023-04-11", "2023-05-12", "2023-06-09",
+    "2023-07-12", "2023-08-11", "2023-09-12", "2023-10-12", "2023-11-09", "2023-12-08",
+    "2024-01-12", "2024-02-08", "2024-03-08", "2024-04-11", "2024-05-10", "2024-06-12",
+    "2024-07-12", "2024-08-12", "2024-09-12", "2024-10-11", "2024-11-08", "2024-12-10",
+    "2025-01-10", "2025-02-11", "2025-03-11", "2025-04-10", "2025-05-12", "2025-06-12",
+    "2025-07-11", "2025-08-12", "2025-09-11", "2025-10-10", "2025-11-10", "2025-12-10",
+    "2026-01-12", "2026-02-11", "2026-03-11", "2026-04-10"
+  ],
+  "nfp_fridays": {
+    "_comment": "Non-Farm Payroll release 8:30 ET first Friday of each month. Equity indexes very active at that time.",
+    "recent": [
+      "2025-01-03", "2025-02-07", "2025-03-07", "2025-04-04", "2025-05-02", "2025-06-06",
+      "2025-07-03", "2025-08-01", "2025-09-05", "2025-10-03", "2025-11-07", "2025-12-05",
+      "2026-01-02", "2026-02-06", "2026-03-06", "2026-04-03"
+    ]
+  },
+  "major_events": [
+    {"date": "2020-03-09", "event": "COVID crash begins, oil price war", "impact": "crude -24%, ES -8%"},
+    {"date": "2020-03-23", "event": "Fed QE infinity + ES bottom", "impact": "ES low, reversal begins"},
+    {"date": "2020-04-20", "event": "WTI negative oil price", "impact": "CL closed at -$37"},
+    {"date": "2022-02-24", "event": "Russia invades Ukraine", "impact": "CL +$8, wheat limit up, gold up"},
+    {"date": "2022-03-16", "event": "First 2022 Fed hike (25bp)", "impact": "rates/bonds down"},
+    {"date": "2022-05-04", "event": "50bp hike surprise", "impact": "ES -4%"},
+    {"date": "2022-06-15", "event": "75bp hike", "impact": "bonds -3%"},
+    {"date": "2022-09-13", "event": "Hot CPI, ES -4.3%", "impact": "massive equity drawdown"},
+    {"date": "2023-03-10", "event": "SVB collapses", "impact": "ZN rally, bank stocks crash"},
+    {"date": "2023-03-13", "event": "BTFP announced, bond rally", "impact": "ZN +2pts"},
+    {"date": "2023-10-27", "event": "Israel-Gaza escalation", "impact": "CL, GC up"},
+    {"date": "2024-01-10", "event": "BTC ETF approved", "impact": "crypto rally, not futures"},
+    {"date": "2024-08-05", "event": "Yen carry trade unwind, VIX spike", "impact": "NQ -6% intraday"},
+    {"date": "2024-11-06", "event": "Trump 2024 election win", "impact": "ES +2.5%, bonds -2%"},
+    {"date": "2025-04-02", "event": "Liberation Day tariff announcement", "impact": "ES -3%, gold all-time highs"},
+    {"date": "2025-09-17", "event": "Fed first 2025 cut (50bp)", "impact": "ZN rally, ES mixed"},
+    {"date": "2026-01-28", "event": "Fed hold, dovish language", "impact": "ZN +25 ticks"},
+    {"date": "2026-03-18", "event": "Tariff escalation round 2", "impact": "grains volatility, ES -2%"}
+  ],
+  "opec_meetings": [
+    "2023-06-04", "2023-11-30", "2024-06-02", "2024-12-05", "2025-04-03", "2025-09-07", "2026-03-05"
+  ]
+}
