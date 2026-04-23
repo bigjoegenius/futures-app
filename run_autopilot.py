@@ -42,7 +42,9 @@ from futures_config import DB_PATH, FUTURES
 from market_analyzer import load_bars, get_market_overview, generate_hourly_report_with_ai, STRATEGIES
 from strategy_engine import StrategyEngine, TradeReport, CONTRACT_SPECS, DEFAULT_STRATEGIES
 from autopilot import AutoPilot
-from confidence_tracker import ConfidenceTracker
+# Shared module lives at ~/trading/trading_core/ — one level above this app folder
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from trading_core.confidence_tracker import ConfidenceTracker
 import news_provider
 import live_prices
 
@@ -58,6 +60,14 @@ FETCH_INTERVAL_SEC      = 15 * 60
 LIVE_POLL_INTERVAL_SEC  = 30
 AUTOPILOT_INTERVAL_SEC  = 60 * 60
 REPORT_HOUR_ET          = 16     # daily recap at 4pm ET
+
+# Optional env-var allowlist: TRADE_SYMBOLS=ES=F,NQ=F limits both the
+# autopilot and static engines to just those contracts. Unset = trade all.
+_raw_allow = os.environ.get("TRADE_SYMBOLS", "").strip()
+TRADE_SYMBOLS_ALLOWLIST: set[str] | None = (
+    {s.strip() for s in _raw_allow.split(",") if s.strip()}
+    if _raw_allow else None
+)
 
 # Rolling window of recent trade confidence scores. New trades whose
 # confidence lands in the top (100 - HIGH_CONVICTION_PERCENTILE)% fire
@@ -180,6 +190,39 @@ def _maybe_log_minimax():
         log(f"minimax read error: {e}")
 
 
+# ─── Live price fetch ──────────────────────────────────────────────────
+LIVE_PRICE_MAX_AGE_SEC = 5 * 60   # yfinance is 10-15min delayed; 5min is "fresh enough"
+
+def fetch_live_price(symbol: str) -> float | None:
+    """Return the most recent `last` from latest_prices for `symbol`, or None
+    if the row is missing or older than LIVE_PRICE_MAX_AGE_SEC.
+
+    The strategy engine falls back to the 1h bar close when None is returned,
+    which is what it used to always do — so a stale feed degrades to the old
+    behavior rather than opening trades on bad prices."""
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=5)
+        conn.execute("PRAGMA busy_timeout=2000")
+        row = conn.execute(
+            "SELECT last, updated_at FROM latest_prices WHERE symbol = ?",
+            (symbol,),
+        ).fetchone()
+        conn.close()
+        if not row or row[0] is None:
+            return None
+        price, ts_str = float(row[0]), row[1]
+        try:
+            ts = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            age = (datetime.now(timezone.utc) - ts).total_seconds()
+            if age > LIVE_PRICE_MAX_AGE_SEC:
+                return None
+        except Exception:
+            pass
+        return price
+    except Exception:
+        return None
+
+
 # ─── Workers ───────────────────────────────────────────────────────────
 class LivePriceWorker(threading.Thread):
     def __init__(self, stop_event):
@@ -233,11 +276,14 @@ class StrategyWorker(threading.Thread):
             for sym in FUTURES.keys():
                 if sym not in CONTRACT_SPECS:
                     continue
+                if TRADE_SYMBOLS_ALLOWLIST is not None and sym not in TRADE_SYMBOLS_ALLOWLIST:
+                    continue
                 df = load_bars(sym, "1h", 300)
                 if df is None:
                     continue
                 try:
-                    self.engine.step(sym, df, timeframe="1h")
+                    live = fetch_live_price(sym)
+                    self.engine.step(sym, df, timeframe="1h", live_price=live)
                 except Exception as e:
                     log(f"[{self.portfolio}] strategy step {sym} error: {e}")
             _save_trade_log(self.engine, self.portfolio)
@@ -408,6 +454,12 @@ def main():
 
     from db_setup import create_database
     create_database()
+
+    if TRADE_SYMBOLS_ALLOWLIST is not None:
+        log(f"TRADE_SYMBOLS allowlist active — only trading: "
+            f"{sorted(TRADE_SYMBOLS_ALLOWLIST)}")
+    else:
+        log("TRADE_SYMBOLS unset — trading all configured futures")
 
     # Seed the rolling confidence window from any prior closed trades on
     # this box so the top-5% gate doesn't start completely empty after

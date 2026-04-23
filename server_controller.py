@@ -63,9 +63,15 @@ DARK_CARD = "#161b22"
 BORDER = "#30363d"
 TEXT = "#c9d1d9"
 MUTED = "#8b949e"
+DISABLED = "#484f58"       # paused markets/strategies in the treeview
 GREEN = "#3fb950"
 RED = "#f85149"
 ACCENT = "#58a6ff"
+
+# Markets currently being traded. Keep in sync with TRADE_SYMBOLS in
+# ~/futures-app/.env. Rows for other symbols still show (data keeps
+# collecting) but render dimmed with a "PAUSED" tag.
+TRADED_FUTURES = {"ES=F", "NQ=F"}
 
 
 # ─── API client ────────────────────────────────────────────────────────
@@ -254,6 +260,10 @@ class FuturesControllerApp:
 
         self.prices_tree.tag_configure("up", foreground=GREEN)
         self.prices_tree.tag_configure("dn", foreground=RED)
+        # Paused markets (not in TRADED_FUTURES): grey out the whole row so
+        # the data collector activity still shows but it's visually obvious
+        # nothing is being traded there.
+        self.prices_tree.tag_configure("paused", foreground=DISABLED)
 
     # ── Services ───────────────────────────────────────────────────────
     def _build_services_card(self, parent):
@@ -384,9 +394,12 @@ class FuturesControllerApp:
         self.prices_tree.delete(*self.prices_tree.get_children())
         for sym, data in sorted(prices.items()):
             pct = data["pct"]
-            tag = "up" if pct >= 0 else "dn"
+            is_paused = sym not in TRADED_FUTURES
+            # "paused" styling overrides up/dn so the row reads as inactive.
+            tag = "paused" if is_paused else ("up" if pct >= 0 else "dn")
+            sym_label = f"{sym}  (paused)" if is_paused else sym
             self.prices_tree.insert("", "end", values=(
-                sym, f"{data['last']:.2f}", f"{pct:+.2f}%"
+                sym_label, f"{data['last']:.2f}", f"{pct:+.2f}%"
             ), tags=(tag,))
 
     def _apply_portfolio(self, s: dict):

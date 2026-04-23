@@ -142,17 +142,31 @@ class StrategyEngine:
         self.enabled.discard(strategy)
 
     # ── Core loop ──────────────────────────────────────────────────────
-    def step(self, symbol: str, df: pd.DataFrame, timeframe: str = "1h") -> None:
-        """Run one tick of the engine for one symbol."""
+    def step(self, symbol: str, df: pd.DataFrame, timeframe: str = "1h",
+             live_price: Optional[float] = None) -> None:
+        """Run one tick of the engine for one symbol.
+
+        `live_price`, when provided, is used as the fill price for new market
+        entries and widens the high/low envelope for stop/target checks so
+        they can trigger mid-bar. Leave it None for backtests (walk-forward
+        replay must use only closed-bar data)."""
         if df is None or len(df) < 60:
             return
         spec = CONTRACT_SPECS.get(symbol)
         if not spec:
             return
 
-        last = float(df["close"].iloc[-1])
-        high = float(df["high"].iloc[-1])
-        low = float(df["low"].iloc[-1])
+        bar_close = float(df["close"].iloc[-1])
+        bar_high = float(df["high"].iloc[-1])
+        bar_low = float(df["low"].iloc[-1])
+        lp = float(live_price) if live_price is not None else None
+        # For market entries, fill at the live tick when it's available;
+        # otherwise fall back to the last bar's close (legacy behavior).
+        last = lp if lp is not None else bar_close
+        # Widen the bar envelope with the live tick so stops/targets can
+        # trigger between bar boundaries.
+        high = max(bar_high, lp) if lp is not None else bar_high
+        low = min(bar_low, lp) if lp is not None else bar_low
         now = df["datetime"].iloc[-1].isoformat() if "datetime" in df else datetime.now(timezone.utc).isoformat()
 
         # One entry per bar per symbol — without this, a 5-min step loop over
@@ -161,9 +175,18 @@ class StrategyEngine:
 
         pos = self.positions.get(symbol)
         if pos is not None:
-            self._manage_position(pos, high, low, last, now, spec)
-            if symbol in self.positions:
-                return
+            # Check EVERY bar from entry onward, not just the latest. Without
+            # this, a position whose TP/SL was hit on any bar other than the
+            # current one gets stuck open forever (2026-04-22 phantom-open bug).
+            self._sweep_manage_position(pos, df, spec)
+            if symbol not in self.positions:
+                pass  # was closed during sweep
+            else:
+                # Fallback to last-bar check in case sweep couldn't resolve
+                # (e.g. entry_time not found in df)
+                self._manage_position(pos, high, low, last, now, spec)
+                if symbol in self.positions:
+                    return
 
         if not is_new_bar:
             return
@@ -314,6 +337,54 @@ class StrategyEngine:
             self._close_position(pos, pos.stop_price, ts, "stop", spec)
         elif hit_target:
             self._close_position(pos, pos.target_price, ts, "target", spec)
+
+    def _sweep_manage_position(self, pos, df: "pd.DataFrame", spec) -> None:
+        """Walk every bar from the position's entry time forward and close at
+        the FIRST bar whose high/low breaches stop or target. This is the
+        correct implementation of 'has the trade exited yet' — the previous
+        last-bar-only version missed exits that happened on intermediate
+        bars, leaving phantom-open positions in memory.
+
+        Bars are assumed ordered oldest→newest with a 'datetime' column.
+        """
+        if df is None or df.empty:
+            return
+        # Find the first bar whose datetime is > entry_time. That's the first
+        # bar that could have closed the trade (entry bar itself doesn't —
+        # the position opened at its close).
+        try:
+            entry_ts = pd.to_datetime(pos.entry_time, utc=True, errors="coerce")
+            if pd.isna(entry_ts):
+                return
+            times = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
+        except Exception:
+            return
+        # Iterate bars after entry. Close on the first TP/SL breach we find.
+        after_mask = times > entry_ts
+        if not after_mask.any():
+            return
+        sub = df[after_mask]
+        for _, bar in sub.iterrows():
+            try:
+                high = float(bar["high"])
+                low = float(bar["low"])
+                bts = bar.get("datetime") if hasattr(bar, "get") else bar["datetime"]
+                ts = bts.isoformat() if hasattr(bts, "isoformat") else str(bts)
+            except Exception:
+                continue
+            hit_stop = (pos.direction == "long" and low <= pos.stop_price) or \
+                       (pos.direction == "short" and high >= pos.stop_price)
+            hit_target = (pos.direction == "long" and high >= pos.target_price) or \
+                         (pos.direction == "short" and low <= pos.target_price)
+            if hit_stop and hit_target:
+                self._close_position(pos, pos.stop_price, ts, "stop", spec)
+                return
+            if hit_stop:
+                self._close_position(pos, pos.stop_price, ts, "stop", spec)
+                return
+            if hit_target:
+                self._close_position(pos, pos.target_price, ts, "target", spec)
+                return
 
     def close_all(self, reason: str = "manual") -> None:
         """Force-close every open position at its last known price."""
