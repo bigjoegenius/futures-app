@@ -222,6 +222,128 @@ survives ISP IP changes. Free for personal use up to 100 devices.
 
 ---
 
+## Stop the PWA URL from changing on every restart
+
+The reason your `web_controller.py` URL keeps changing is in
+`web_controller.py:74-84`: if `WEB_CONTROLLER_TOKEN` / `WEB_VIEWER_TOKEN`
+aren't set, it generates fresh random ones every boot and only prints them to
+stdout. Pin them once and the URL is stable forever.
+
+On Adamserver:
+
+```bash
+ssh adamserver
+cd ~/futures-app
+# Generate two strong tokens (one-time)
+ADMIN=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
+VIEWER=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
+
+# Append to .env if not already pinned
+grep -q '^WEB_CONTROLLER_TOKEN=' .env && \
+  sed -i "s|^WEB_CONTROLLER_TOKEN=.*|WEB_CONTROLLER_TOKEN=$ADMIN|" .env || \
+  echo "WEB_CONTROLLER_TOKEN=$ADMIN" >> .env
+
+grep -q '^WEB_VIEWER_TOKEN=' .env && \
+  sed -i "s|^WEB_VIEWER_TOKEN=.*|WEB_VIEWER_TOKEN=$VIEWER|" .env || \
+  echo "WEB_VIEWER_TOKEN=$VIEWER" >> .env
+
+chmod 600 .env
+
+# Restart the service so it picks up the new env
+sudo systemctl restart futures-web 2>/dev/null \
+  || systemctl --user restart futures-web 2>/dev/null \
+  || echo "Service name may differ — check 'systemctl --user list-units | grep futures'"
+```
+
+After this, the URL is a fixed:
+
+```
+http://<adamserver-host>:5100/?token=<WEB_CONTROLLER_TOKEN>
+```
+
+Save it as a bookmark on your phone's home screen — done.
+
+---
+
+## A `show-url` helper for the rare case you do need to recover it
+
+Even with tokens pinned, sometimes you'll forget which token is which or want
+to confirm the service is actually up. On Adamserver:
+
+```bash
+nano ~/bin/show-url
+```
+
+```bash
+#!/usr/bin/env bash
+# Print the current PWA URL with token, plus quick health check.
+set -euo pipefail
+ENV_FILE="$HOME/futures-app/.env"
+PORT="${PORT:-5100}"
+HOST="$(hostname -f 2>/dev/null || hostname)"
+
+if [[ ! -f "$ENV_FILE" ]]; then
+  echo "no .env at $ENV_FILE" >&2; exit 1
+fi
+
+ADMIN=$(grep -E '^WEB_CONTROLLER_TOKEN=' "$ENV_FILE" | cut -d= -f2-)
+VIEWER=$(grep -E '^WEB_VIEWER_TOKEN=' "$ENV_FILE" | cut -d= -f2-)
+
+if [[ -z "$ADMIN" ]]; then
+  echo "WEB_CONTROLLER_TOKEN not pinned in .env — service is generating a fresh one each boot."
+  echo "Run the pinning steps in SSH_REMOTE_ACCESS.md."
+  exit 1
+fi
+
+echo "Admin:  http://$HOST:$PORT/?token=$ADMIN"
+echo "Viewer: http://$HOST:$PORT/?token=$VIEWER"
+echo
+echo -n "Health: "
+curl -sf -m 3 "http://localhost:$PORT/api/health?token=$ADMIN" \
+  && echo " ✓ up" || echo " ✗ no response (is futures-web running?)"
+```
+
+```bash
+chmod +x ~/bin/show-url
+```
+
+Now from Blink Shell on your phone:
+
+```bash
+ssh adamserver show-url
+```
+
+Three taps to get the working URL, even if you forgot it.
+
+---
+
+## What "code from my phone" looks like in practice
+
+Once you're SSH'd in via Blink:
+
+```bash
+claude-futures        # opens claude inside ~/futures-app via tmux
+```
+
+Then you can type things like:
+
+- *"Add a 'paused' indicator to the dashboard sidebar"*
+- *"What's the largest losing trade in the last 7 days and which strategy?"*
+- *"Show me the diff of strategy_engine.py since last week"*
+
+I'll edit files, run scripts, commit, push — same as on the desktop. Detach
+with `Ctrl-b d` to leave it running, reattach later with `claude-futures`.
+
+For *very* light edits you can also just open files in `nano` directly:
+
+```bash
+nano ~/futures-app/futures_config.py
+```
+
+But the claude session is more useful — it understands the whole project.
+
+---
+
 ## Troubleshooting
 
 - **`Permission denied (publickey)`**: phone's public key isn't in
