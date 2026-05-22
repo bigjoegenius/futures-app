@@ -3,8 +3,9 @@
 market_analyzer_daemon.py — periodic market analysis email for futures.
 
 Mirrors the crypto-app daemon: builds a snapshot, asks Claude to write a
-short analysis, emails it. Uses the `claude` CLI (Claude Code subscription)
-with the Anthropic SDK as a fallback.
+short analysis, emails it. Uses the local `claude` CLI exclusively
+(Claude Code subscription auth via CLAUDE_CODE_OAUTH_TOKEN). No metered
+API key.
 
 Usage:
     python3 market_analyzer_daemon.py             # one-shot dry run
@@ -34,14 +35,13 @@ except Exception:
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "futures.db")
-MINIMAX_PATH = os.path.join(BASE_DIR, "minimax_insights.json")
 LOG_PATH = os.path.join(BASE_DIR, "market_analyzer_daemon.log")
 
 ANALYZER_RECIPIENT = os.environ.get("BALDWETCOBY_EMAIL_TO", "baldwetcoby@gmail.com")
 SUBJECT_TAG = "[FUTURES ANALYZER]"
 
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "/usr/bin/claude")
-CLAUDE_MODEL_FALLBACK = "claude-opus-4-7"
+CLAUDE_MODEL = "sonnet"
 
 LOOP_INTERVAL_SEC = 4 * 60 * 60  # 4 hours
 
@@ -66,8 +66,7 @@ def _db():
 
 def collect_snapshot() -> dict:
     snap = {"generated_at": datetime.now(timezone.utc).isoformat(),
-            "prices": {}, "recent_trades": [], "open_positions": [],
-            "minimax": None}
+            "prices": {}, "recent_trades": [], "open_positions": []}
 
     try:
         conn = _db()
@@ -111,13 +110,6 @@ def collect_snapshot() -> dict:
         conn.close()
     except Exception as e:
         log(f"snapshot DB error: {e}")
-
-    try:
-        if os.path.exists(MINIMAX_PATH):
-            with open(MINIMAX_PATH) as f:
-                snap["minimax"] = json.load(f)
-    except Exception as e:
-        log(f"minimax read error: {e}")
 
     return snap
 
@@ -167,97 +159,41 @@ def format_prompt(snap: dict) -> str:
             lines.append(f"  {t.get('symbol')} {t.get('strategy')} {t.get('direction')} "
                          f"pnl ${t.get('pnl_dollars'):+.2f}  reason {t.get('exit_reason')}")
 
-    mm = snap.get("minimax") or {}
-    sig = (mm.get("structured_signals") or {}) if isinstance(mm, dict) else {}
-    if sig:
-        lines.append("")
-        lines.append("— MiniMax signals —")
-        lines.append(f"  bias {sig.get('overall_bias')}  conf {sig.get('confidence')}  "
-                     f"danger {sig.get('danger_level')}  action {sig.get('immediate_action')}")
-        strategies = sig.get("strategies") or {}
-        on = [k for k, v in strategies.items() if isinstance(v, dict) and v.get("enable")]
-        if on:
-            lines.append(f"  enabled: {', '.join(on)}")
-
     return "\n".join(lines)
 
 
-# ─── Claude calls — same pattern as crypto daemon ────────────────────────
-
-def _claude_cli_available() -> bool:
-    if not os.path.exists(CLAUDE_BIN):
-        return False
-    try:
-        r = subprocess.run(
-            [CLAUDE_BIN, "-p", "Reply with the single word OK"],
-            input="", capture_output=True, text=True, timeout=20
-        )
-        out = (r.stdout or "") + (r.stderr or "")
-        if "Not logged in" in out or "Please run /login" in out:
-            return False
-        if r.returncode != 0:
-            return False
-        return "OK" in out.upper()
-    except Exception:
-        return False
-
+# ─── Claude CLI call ──────────────────────────────────────────────────────
 
 def call_claude_cli(prompt: str) -> str | None:
+    # Strip ANTHROPIC_API_KEY so the CLI uses the OAuth subscription token
+    # and never falls back to metered API spend.
+    cli_env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
     try:
         r = subprocess.run(
-            [CLAUDE_BIN, "-p", "--output-format", "text"],
-            input=prompt, capture_output=True, text=True, timeout=180
+            [CLAUDE_BIN, "-p", "--model", CLAUDE_MODEL, "--output-format", "text"],
+            input=prompt, capture_output=True, text=True, timeout=300, env=cli_env,
         )
         if r.returncode != 0:
             log(f"claude CLI exit {r.returncode}: {(r.stderr or '')[:200]}")
             return None
         return (r.stdout or "").strip() or None
+    except subprocess.TimeoutExpired:
+        log("claude CLI timed out (>300s)")
+        return None
+    except FileNotFoundError:
+        log(f"claude CLI not found at {CLAUDE_BIN}")
+        return None
     except Exception as e:
         log(f"claude CLI error: {e}")
         return None
 
 
-def call_claude_sdk(prompt: str) -> str | None:
-    try:
-        import anthropic
-    except ImportError:
-        log("anthropic SDK not installed")
-        return None
-    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-    if not key:
-        log("ANTHROPIC_API_KEY not set")
-        return None
-    try:
-        client = anthropic.Anthropic(api_key=key)
-        resp = client.messages.create(
-            model=CLAUDE_MODEL_FALLBACK,
-            max_tokens=1500,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        parts = []
-        for block in resp.content:
-            if getattr(block, "type", "") == "text":
-                parts.append(block.text)
-        return "\n".join(parts).strip() or None
-    except Exception as e:
-        log(f"anthropic SDK error: {e}")
-        return None
-
-
 def generate_analysis(snap: dict) -> tuple[str, str]:
     prompt = format_prompt(snap)
-    if _claude_cli_available():
-        log("using claude CLI (Claude Code subscription)")
-        text = call_claude_cli(prompt)
-        if text:
-            return text, "claude-cli"
-        log("claude CLI returned no output; falling back to SDK")
-    else:
-        log("claude CLI unavailable or not logged in; using SDK fallback")
-    text = call_claude_sdk(prompt)
+    text = call_claude_cli(prompt)
     if text:
-        return text, "anthropic-sdk"
-    return "(No analysis — neither claude CLI nor ANTHROPIC_API_KEY was usable.)", "none"
+        return text, "claude-cli"
+    return "(No analysis — claude CLI unavailable. Check `claude` install on this host.)", "none"
 
 
 def send_email(subject: str, body: str) -> bool:

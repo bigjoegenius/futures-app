@@ -4,12 +4,14 @@ autopilot.py — AI strategy selector for the futures app.
 
 Every hour (configurable):
   1. Build a market snapshot (all symbols, current strategy scores)
-  2. Send it to Claude with trade history and let the AI decide:
+  2. Pipe it through the local `claude` CLI (Claude Code subscription) and
+     let the AI decide:
        - which strategies should be enabled this cycle
        - which risk mode (conservative / moderate / aggressive)
   3. Apply the AI's choices back to the StrategyEngine.
 
-If ANTHROPIC_API_KEY is missing, falls back to "enable top-scoring strategies".
+Auth is the CLI's CLAUDE_CODE_OAUTH_TOKEN (subscription) — no metered API key.
+If the CLI is unavailable, falls back to "enable top-scoring strategies".
 All decisions are logged to the `autopilot_log` table so you can audit them.
 """
 
@@ -18,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import subprocess
 
 try:
     from dotenv import load_dotenv
@@ -51,7 +54,7 @@ class AutoPilot:
         self._thread: Optional[threading.Thread] = None
         self.last_decision: Optional[dict] = None
         self.ai_calls = 0
-        self.model_name = "claude-opus-4-7"
+        self.model_name = "sonnet"
 
     # ── Lifecycle ──────────────────────────────────────────────────────
     def start(self) -> None:
@@ -95,28 +98,30 @@ class AutoPilot:
 
     # ── AI / fallback ──────────────────────────────────────────────────
     def _ask_ai(self, overview: dict, trades_tail: list) -> dict:
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-        if not api_key:
-            return self._local_decision(overview, reason="no ANTHROPIC_API_KEY")
+        claude_bin = os.environ.get("CLAUDE_BIN", "/usr/bin/claude")
+        if not os.path.exists(claude_bin):
+            return self._local_decision(overview, reason=f"claude CLI not found at {claude_bin}")
 
-        try:
-            import anthropic
-        except ImportError:
-            return self._local_decision(overview, reason="anthropic SDK missing")
-
-        client = anthropic.Anthropic(api_key=api_key)
         prompt = self._build_prompt(overview, trades_tail)
+        # Strip ANTHROPIC_API_KEY so the CLI always uses the OAuth subscription
+        # token and never falls back to metered API spend.
+        cli_env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
         try:
-            msg = client.messages.create(
-                model=self.model_name,
-                max_tokens=2500,
-                messages=[{"role": "user", "content": prompt}],
+            r = subprocess.run(
+                [claude_bin, "-p", "--model", self.model_name, "--output-format", "text"],
+                input=prompt, capture_output=True, text=True, timeout=300, env=cli_env,
             )
+            if r.returncode != 0:
+                return self._local_decision(overview, reason=f"claude CLI exit {r.returncode}: {(r.stderr or '')[:120]}")
+            text = (r.stdout or "").strip()
+            if not text:
+                return self._local_decision(overview, reason="claude CLI returned empty output")
             self.ai_calls += 1
-            text = "".join(getattr(b, "text", "") for b in msg.content).strip()
             return self._parse_decision(text, overview)
+        except subprocess.TimeoutExpired:
+            return self._local_decision(overview, reason="claude CLI timed out (>300s)")
         except Exception as e:
-            return self._local_decision(overview, reason=f"Claude error: {e}")
+            return self._local_decision(overview, reason=f"claude CLI error: {e}")
 
     def _build_prompt(self, overview: dict, trades_tail: list) -> str:
         snap = {}

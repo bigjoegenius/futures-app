@@ -19,6 +19,7 @@ import argparse
 import json
 import os
 import sqlite3
+import subprocess
 from datetime import datetime, timezone, timedelta, time as dtime
 from typing import Optional
 
@@ -268,6 +269,17 @@ STRATEGIES = {
         "markets": ["all"],
         "stop_atr_mult": 1.0, "target_atr_mult": 2.5,
         "description": "20-bar break, retest of level holds, then continuation.",
+    },
+
+    # ── Liquidity Sweep (1) ─────────────────────────────────────────
+    "liquidity_sweep_reclaim": {
+        "name": "Liquidity Sweep & Reclaim",
+        "direction": "BOTH",
+        "timeframes": ["15m", "1h", "1d"],
+        "markets": ["GC=F", "SI=F", "ES=F", "NQ=F", "CL=F"],
+        "stop_atr_mult": 1.0, "target_atr_mult": 1.8,
+        "description": "Fade false breakouts: equal highs/lows swept then reclaimed. "
+                       "Uses EMA50 trend filter on daily.",
     },
 }
 
@@ -899,6 +911,157 @@ def _check_breakout_retest(df, ind):
     return _empty("no retest")
 
 
+def _check_liquidity_sweep_reclaim(df, ind, **kwargs):
+    """Liquidity Sweep & Reclaim — fade false breakouts at equal highs/lows.
+
+    The pattern: consolidation forms equal highs (or lows), creating a
+    visible liquidity pool. Price sweeps through those levels, triggering
+    stops and trapping breakout traders, then reclaims back inside. Enter
+    in the reversal direction once the reclaim candle closes.
+
+    Optimized parameters per timeframe (from 192-combo sweep over 25 yrs):
+      15m: lookback=10, tol=0.5, min_touches=2, no trend filter
+      1h:  lookback=30, tol=0.3, min_touches=3, no trend filter
+      1d:  lookback=10, tol=0.5, min_touches=2, EMA50 trend filter
+    """
+    if len(df) < 30:
+        return _empty("short history")
+
+    atr_val = ind["atr_last"]
+    if atr_val <= 0:
+        return _empty("flat atr")
+
+    # Timeframe-specific optimized parameters
+    tf = kwargs.get("tf", "1h")
+    _OPT = {
+        "15m": {"lookback": 10, "tol_mult": 0.5, "min_touches": 2, "trend_filter": False},
+        "1h":  {"lookback": 30, "tol_mult": 0.3, "min_touches": 3, "trend_filter": False},
+        "1d":  {"lookback": 10, "tol_mult": 0.5, "min_touches": 2, "trend_filter": True},
+    }
+    params = _OPT.get(tf, _OPT["1h"])
+    lookback = params["lookback"]
+    tol_mult = params["tol_mult"]
+    min_touches = params["min_touches"]
+    use_trend = params["trend_filter"]
+
+    # EMA50 trend filter for daily — only trade with the trend
+    ema50_val = None
+    if use_trend:
+        e50 = ema(df["close"], 50)
+        if not pd.isna(e50.iloc[-1]):
+            ema50_val = float(e50.iloc[-1])
+
+    # --- BEARISH SWEEP (equal highs swept, reclaim below → SHORT) ---
+    bear_result = _sweep_side(df, ind, atr_val, side="bear",
+                              lookback=lookback, tol_mult=tol_mult,
+                              min_touches=min_touches, ema50_val=ema50_val,
+                              use_trend=use_trend)
+
+    # --- BULLISH SWEEP (equal lows swept, reclaim above → LONG) ---
+    bull_result = _sweep_side(df, ind, atr_val, side="bull",
+                              lookback=lookback, tol_mult=tol_mult,
+                              min_touches=min_touches, ema50_val=ema50_val,
+                              use_trend=use_trend)
+
+    # Return whichever has the higher score (or neither)
+    if bear_result["score"] >= bull_result["score"] and bear_result["score"] > 0:
+        return bear_result
+    if bull_result["score"] > 0:
+        return bull_result
+    return _empty("no sweep-reclaim setup")
+
+
+def _sweep_side(df, ind, atr_val, side="bear", lookback=20, tol_mult=0.3,
+                min_touches=2, ema50_val=None, use_trend=False):
+    """Check for a liquidity sweep on one side (bear = above highs, bull = below lows)."""
+    tol = atr_val * tol_mult
+
+    if len(df) < lookback + 3:
+        return _empty("short history")
+
+    window = df.iloc[-(lookback + 2):-2]
+
+    if side == "bear":
+        levels = window["high"].values
+        resistance = np.max(levels)
+        touches = int(np.sum(np.abs(levels - resistance) < tol))
+        if touches < min_touches:
+            return _empty(f"only {touches} high touches")
+
+        sweep_bar = df.iloc[-2]
+        sweep_extreme = float(sweep_bar["high"])
+        if sweep_extreme <= resistance:
+            return _empty("no sweep above highs")
+        sweep_penetration = (sweep_extreme - resistance) / atr_val
+        if sweep_penetration < 0.05:
+            return _empty("trivial sweep")
+
+        current_close = float(df["close"].iloc[-1])
+        if current_close >= resistance:
+            return _empty("not reclaimed below")
+
+        # Trend filter: skip shorts when price is above EMA50 (uptrend)
+        if use_trend and ema50_val is not None and current_close > ema50_val:
+            return _empty("trend filter: above EMA50, skip short")
+
+        reclaim_depth = (resistance - current_close) / atr_val
+        rejection_wick = (sweep_extreme - float(df["close"].iloc[-2])) / atr_val
+
+        base = 55
+        touch_bonus = min((touches - 2) * 4, 12)
+        sweep_bonus = min(sweep_penetration * 12, 15)
+        reclaim_bonus = min(reclaim_depth * 10, 10)
+        wick_bonus = min(rejection_wick * 5, 8)
+
+        score = base + touch_bonus + sweep_bonus + reclaim_bonus + wick_bonus
+        return {
+            "score": _clip(score),
+            "direction": "SHORT",
+            "note": (f"bear sweep: {touches} highs near {resistance:.2f}, "
+                     f"swept {sweep_penetration:.2f}x ATR, reclaimed"),
+        }
+
+    else:  # bull
+        levels = window["low"].values
+        support = np.min(levels)
+        touches = int(np.sum(np.abs(levels - support) < tol))
+        if touches < min_touches:
+            return _empty(f"only {touches} low touches")
+
+        sweep_bar = df.iloc[-2]
+        sweep_extreme = float(sweep_bar["low"])
+        if sweep_extreme >= support:
+            return _empty("no sweep below lows")
+        sweep_penetration = (support - sweep_extreme) / atr_val
+        if sweep_penetration < 0.05:
+            return _empty("trivial sweep")
+
+        current_close = float(df["close"].iloc[-1])
+        if current_close <= support:
+            return _empty("not reclaimed above")
+
+        # Trend filter: skip longs when price is below EMA50 (downtrend)
+        if use_trend and ema50_val is not None and current_close < ema50_val:
+            return _empty("trend filter: below EMA50, skip long")
+
+        reclaim_depth = (current_close - support) / atr_val
+        rejection_wick = (float(df["close"].iloc[-2]) - sweep_extreme) / atr_val
+
+        base = 55
+        touch_bonus = min((touches - 2) * 4, 12)
+        sweep_bonus = min(sweep_penetration * 12, 15)
+        reclaim_bonus = min(reclaim_depth * 10, 10)
+        wick_bonus = min(rejection_wick * 5, 8)
+
+        score = base + touch_bonus + sweep_bonus + reclaim_bonus + wick_bonus
+        return {
+            "score": _clip(score),
+            "direction": "LONG",
+            "note": (f"bull sweep: {touches} lows near {support:.2f}, "
+                     f"swept {sweep_penetration:.2f}x ATR, reclaimed"),
+        }
+
+
 # ─── Dispatcher ─────────────────────────────────────────────────────────
 _CHECKER = {
     "ema_cross":             lambda df, ind, **k: _check_ema_cross(df, ind),
@@ -929,6 +1092,7 @@ _CHECKER = {
     "cattle_cot_long":       lambda df, ind, **k: _check_cattle_cot_long(df, ind, symbol=k.get("symbol")),
     "range_reversal":        lambda df, ind, **k: _check_range_reversal(df, ind),
     "breakout_retest":       lambda df, ind, **k: _check_breakout_retest(df, ind),
+    "liquidity_sweep_reclaim": lambda df, ind, **k: _check_liquidity_sweep_reclaim(df, ind, **k),
 }
 
 
@@ -1075,15 +1239,10 @@ def generate_hourly_report_with_ai(market_data: dict, trades: list | None = None
         summary_lines.append(line)
     local_summary = "\n".join(summary_lines)
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        return local_summary + "\n\n[No ANTHROPIC_API_KEY — using local summary.]"
-    try:
-        import anthropic
-    except ImportError:
-        return local_summary + "\n\n[anthropic SDK not installed]"
+    claude_bin = os.environ.get("CLAUDE_BIN", "/usr/bin/claude")
+    if not os.path.exists(claude_bin):
+        return local_summary + f"\n\n[claude CLI not found at {claude_bin} — using local summary.]"
 
-    client = anthropic.Anthropic(api_key=api_key)
     prompt = f"""You are analyzing the US futures market for a day trader.
 
 Snapshot ({len(market_data)} contracts):
@@ -1098,16 +1257,20 @@ Give a concise (<250 words) report covering:
 3. One thing the trader should watch out for
 Be plain-spoken, no markdown, no fluff.
 """
+    cli_env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
     try:
-        msg = client.messages.create(
-            model="claude-opus-4-7",
-            max_tokens=800,
-            messages=[{"role": "user", "content": prompt}],
+        r = subprocess.run(
+            [claude_bin, "-p", "--model", "sonnet", "--output-format", "text"],
+            input=prompt, capture_output=True, text=True, timeout=300, env=cli_env,
         )
-        text = "".join(getattr(b, "text", "") for b in msg.content).strip()
+        if r.returncode != 0:
+            return local_summary + f"\n\n[claude CLI exit {r.returncode}: {(r.stderr or '')[:120]}]"
+        text = (r.stdout or "").strip()
         return text or local_summary
+    except subprocess.TimeoutExpired:
+        return local_summary + "\n\n[claude CLI timed out (>300s)]"
     except Exception as e:
-        return local_summary + f"\n\n[Claude error: {e}]"
+        return local_summary + f"\n\n[claude CLI error: {e}]"
 
 
 # ─── CLI ────────────────────────────────────────────────────────────────

@@ -90,9 +90,8 @@ class TradeReport:
     fees: float = 0.0
     exit_reason: Optional[str] = None
     status: str = "open"
-    # 0-100 probability this trade hits TP before SL; blended from raw
-    # strategy score + live MiniMax per-strategy score + MiniMax overall
-    # bias alignment. Populated at open; preserved through close.
+    # 0-100 probability this trade hits TP before SL, derived from the raw
+    # strategy score. Populated at open; preserved through close.
     confidence: Optional[float] = None
     confidence_source: str = ""
 
@@ -218,65 +217,13 @@ class StrategyEngine:
     def _estimate_confidence(self, strategy: str, direction: str,
                              raw_score: float) -> tuple[Optional[float], str]:
         """
-        Blend raw strategy score with live MiniMax signals to produce a
-        0-100 probability-of-success estimate.
-
-          50%  raw strategy score (already 0-100)
-          30%  MiniMax per-strategy score (if strategy is in MiniMax JSON)
-          20%  MiniMax overall confidence, flipped when direction opposes bias
-
-        Source labels describe which inputs were available.
+        Produce a 0-100 probability-of-success estimate from the raw
+        strategy score.
         """
         if raw_score is None:
             return None, ""
         raw = max(0.0, min(100.0, float(raw_score)))
-
-        mm_strat_score = None
-        mm_overall = None
-        mm_bias = None
-        try:
-            mm_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                   "minimax_insights.json")
-            if os.path.exists(mm_path):
-                with open(mm_path, "r") as f:
-                    mm = json.load(f)
-                sig = mm.get("structured_signals", {}) or {}
-                mm_overall = sig.get("confidence")
-                mm_bias = str(sig.get("overall_bias", "")).upper()
-                strategies = sig.get("strategies", {}) or {}
-                entry = strategies.get(strategy)
-                if isinstance(entry, dict):
-                    mm_strat_score = entry.get("score")
-                elif isinstance(entry, (int, float)):
-                    mm_strat_score = entry
-        except Exception:
-            pass
-
-        try:
-            mm_strat_score = float(mm_strat_score) if mm_strat_score is not None else None
-        except (TypeError, ValueError):
-            mm_strat_score = None
-        try:
-            mm_overall = float(mm_overall) if mm_overall is not None else None
-        except (TypeError, ValueError):
-            mm_overall = None
-
-        parts = [("raw", raw, 0.5)]
-        if mm_strat_score is not None:
-            parts.append(("mm_strat", max(0.0, min(100.0, mm_strat_score)), 0.3))
-        if mm_overall is not None:
-            aligned = max(0.0, min(100.0, mm_overall))
-            if mm_bias == "BULLISH" and direction.lower() == "short":
-                aligned = 100.0 - aligned
-            elif mm_bias == "BEARISH" and direction.lower() == "long":
-                aligned = 100.0 - aligned
-            parts.append(("mm_overall", aligned, 0.2))
-
-        total_w = sum(w for _, _, w in parts)
-        blended = sum(v * w for _, v, w in parts) / total_w
-        blended = max(0.0, min(100.0, round(blended, 1)))
-        source = "+".join(name for name, _, _ in parts)
-        return blended, source
+        return round(raw, 1), "raw"
 
     # ── Position management ────────────────────────────────────────────
     def _open_position(self, symbol, strategy, direction, price, atr_val, ts, spec,

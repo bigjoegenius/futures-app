@@ -1,0 +1,16 @@
+[Unit]
+Description=Futures options scanner — EMA cross + liquidity sweep → options alerts
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/joe/futures-app
+ExecStart=/home/joe/crypto-app/venv/bin/python3 futures_options_scanner.py
+EnvironmentFile=/home/joe/futures-app/.env
+StandardOutput=append:/home/joe/futures-app/futures_options_scanner.log
+StandardError=append:/home/joe/futures-app/futures_options_scanner.log
+TimeoutStartSec=120
+
+[Install]
+WantedBy=default.target

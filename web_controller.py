@@ -56,7 +56,6 @@ import news_provider
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TRADE_LOG_PATH = os.path.join(BASE_DIR, "trade_log.json")
-MINIMAX_INSIGHTS = os.path.join(BASE_DIR, "minimax_insights.json")
 AUTOPILOT_LOG = os.path.join(BASE_DIR, "autopilot_log.txt")
 
 
@@ -113,7 +112,6 @@ ALLOWED_SERVICES = {
     "futures-autopilot":   "AI trading autopilot",
     "futures-live-prices": "Live price poller",
     "futures-analyzer":    "Market analyzer",
-    "futures-minimax":     "MiniMax 10-min AI",
     "futures-collector":   "yfinance candle collector",
 }
 
@@ -294,14 +292,7 @@ def api_candles(symbol: str):
 def api_ai_overview():
     overview = get_market_overview()
     decision = _read_last_autopilot_decision()
-    minimax = None
-    if os.path.exists(MINIMAX_INSIGHTS):
-        try:
-            with open(MINIMAX_INSIGHTS) as f:
-                minimax = json.load(f)
-        except Exception:
-            minimax = None
-    return jsonify({"overview": overview, "autopilot": decision, "minimax": minimax})
+    return jsonify({"overview": overview, "autopilot": decision})
 
 
 @app.route("/api/news-digest")

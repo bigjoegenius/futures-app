@@ -6,11 +6,10 @@ Responsibilities:
   1. Keep fresh data flowing (live_prices every 30s, fetch_data every 15 min)
   2. Run the paper StrategyEngine: step() every 5 minutes across all 18 symbols
   3. Run AutoPilot (Claude AI strategy selector) every hour
-  4. Load MiniMax insights (refreshed by its own service) + compare to Claude
-  5. Daily 4pm ET summary email + high-conviction (rolling top 5% confidence)
+  4. Daily 4pm ET summary email + high-conviction (rolling top 5% confidence)
      per-trade alerts to baldwetcoby@gmail.com. No per-trade email on every
      open/close — only the top-percentile ones.
-  6. Tail an autopilot_log.txt file for web_controller.py to display
+  5. Tail an autopilot_log.txt file for web_controller.py to display
 
 Modes:
   python run_autopilot.py                           # AutoPilot portfolio (AI-gated)
@@ -51,7 +50,6 @@ import live_prices
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_PATH = os.path.join(BASE_DIR, "autopilot_log.txt")
-MINIMAX_JSON = os.path.join(BASE_DIR, "minimax_insights.json")
 TRADE_LOG_JSON = os.path.join(BASE_DIR, "trade_log.json")
 CONFIDENCE_WINDOW_JSON = os.path.join(BASE_DIR, "confidence_window.json")
 
@@ -167,29 +165,6 @@ def _save_trade_log(engine: StrategyEngine, portfolio: str) -> None:
         log(f"trade_log.json write failed: {e}")
 
 
-# ─── MiniMax comparison ────────────────────────────────────────────────
-_mm_last_mtime = 0
-def _maybe_log_minimax():
-    global _mm_last_mtime
-    try:
-        if not os.path.exists(MINIMAX_JSON):
-            return
-        mtime = os.path.getmtime(MINIMAX_JSON)
-        if mtime <= _mm_last_mtime:
-            return
-        _mm_last_mtime = mtime
-        with open(MINIMAX_JSON) as f:
-            mm = json.load(f)
-        sig = mm.get("structured_signals", {}) or {}
-        log(f"MINIMAX: bias={sig.get('overall_bias','?')} "
-            f"conf={sig.get('confidence',0)}% "
-            f"action={sig.get('immediate_action','?')} "
-            f"danger={sig.get('danger_level','?')} "
-            f"tokens={mm.get('total_tokens_used', 0)}")
-    except Exception as e:
-        log(f"minimax read error: {e}")
-
-
 # ─── Live price fetch ──────────────────────────────────────────────────
 LIVE_PRICE_MAX_AGE_SEC = 5 * 60   # yfinance is 10-15min delayed; 5min is "fresh enough"
 
@@ -287,7 +262,6 @@ class StrategyWorker(threading.Thread):
                 except Exception as e:
                     log(f"[{self.portfolio}] strategy step {sym} error: {e}")
             _save_trade_log(self.engine, self.portfolio)
-            _maybe_log_minimax()
             for _ in range(STEP_INTERVAL_SEC):
                 if self.stop_event.is_set():
                     break
@@ -302,6 +276,17 @@ class DailyReportWorker(threading.Thread):
         self.stop_event = stop_event
         self._sent_date = None
     def run(self):
+        # Standalone 4 PM futures recap is DISABLED by default. Its data
+        # (balance, P&L, recent trades w/ confidence, by-symbol breakdown)
+        # is now folded into the evening market brief at 15:30 ET — see
+        # market-brief/evening_brief.py `_futures_autopilot_snapshot` and
+        # `_render_futures_recap_html`. Set FUTURES_STANDALONE_RECAP=1 in
+        # the env to re-enable this thread's email if you ever need it back.
+        if os.environ.get("FUTURES_STANDALONE_RECAP", "0") != "1":
+            log("futures standalone daily recap disabled "
+                "(merged into evening brief). Set "
+                "FUTURES_STANDALONE_RECAP=1 to re-enable.")
+            return
         while not self.stop_event.is_set():
             try:
                 now = datetime.now()

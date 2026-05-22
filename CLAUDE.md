@@ -129,7 +129,6 @@ Ported the full crypto-app control plane.
 **Files created:**
 - autopilot.py — hourly Claude call picks strategies + risk mode
 - news_provider.py — free macro/futures RSS digest (cached 1h)
-- minimax_insights.py — optional MiniMax 10-min AI pass (stubbed if key missing)
 - run_autopilot.py — headless daemon orchestrating all workers
 - web_controller.py — Flask + PWA backend on port 5100
 - templates/index.html, static/app.js, static/style.css, static/sw.js, static/manifest.json
@@ -149,7 +148,6 @@ Ported the full crypto-app control plane.
 - ANTHROPIC_API_KEY (required for AI)
 - WEB_CONTROLLER_TOKEN, WEB_VIEWER_TOKEN (auto-generated if missing)
 - GMAIL_USER, GMAIL_APP_PASSWORD, REPORT_EMAIL_TO (daily email summary)
-- MINIMAX_API_KEY (optional)
 
 **DB tables added:** `latest_prices`, `trades`, `autopilot_log`
 
@@ -205,7 +203,6 @@ Expanded from 6 to 28 strategies, backtested, deployed on adamserver.
 - `backtest_all.py` — walk-forward all (strategy × market × tf) combos, writes DB + per-combo JSON + equity PNG
 - `build_strategy_report.py` — Word doc generator with DB + JSON fallback
 - `autopilot.py` — upgraded to `claude-opus-4-7`, richer prompt (28 strategies), proper JSON schema parsing
-- `minimax_insights.py` — full dual-model rewrite (M2.7 deep + M2.5 structured JSON signals)
 - `run_autopilot.py` — dual-portfolio support (`--portfolio autopilot|static_all`), per-trade emails (open + close),
   wrapped `_open_position` for on-open callback, all emails to `baldwetcoby@gmail.com`
 
@@ -228,10 +225,9 @@ Losing trades get news-tagged when they overlap FOMC/WASDE/OPEC/major events (±
 - Services added (all ENABLED + ACTIVE on 2026-04-21):
   - `futures-autopilot.service` — run_autopilot.py --portfolio autopilot (Claude-gated)
   - `futures-static.service` — run_autopilot.py --portfolio static_all (all 28 always on)
-  - `futures-minimax.service` — minimax_insights.py --loop (10-min M2.7+M2.5)
   - `futures-live-prices.service` — live_prices.py (30s poller)
   - All point at `/home/joe/crypto-app/venv/bin/python3` (reused crypto venv with anthropic/docx/etc)
-  - EnvironmentFile=`/home/joe/futures-app/.env` loads ANTHROPIC_API_KEY, MINIMAX_API_KEY, GMAIL creds,
+  - EnvironmentFile=`/home/joe/futures-app/.env` loads ANTHROPIC_API_KEY, GMAIL creds,
     and BALDWETCOBY_EMAIL_TO=baldwetcoby@gmail.com
 - Email setup: per-trade (open + close) + daily recap at 4pm ET → `baldwetcoby@gmail.com`
   Subject tags `[FUTURES AUTOPILOT]` / `[FUTURES STATIC]` / `[FUTURES DAILY]` for Gmail filters
@@ -281,9 +277,8 @@ top-5% rolling alert. Everything routes to `baldwetcoby@gmail.com`.
   fallback: confidence ≥ 85 triggers until the window has 50+ samples.
 - `strategy_engine.py` — `TradeReport` and `Position` gained `confidence` +
   `confidence_source` fields. New `_estimate_confidence()` blends raw
-  strategy score (50%) + MiniMax per-strategy score (30%) + MiniMax overall
-  confidence aligned with direction (20%). `_open_position()` now takes a
-  `raw_score` kwarg and stores the blended confidence on the Position.
+  strategy score (raw, 100%). `_open_position()` now takes a
+  `raw_score` kwarg and stores the confidence on the Position.
 - `db_setup.py` — `trades` table gets `confidence REAL` + `confidence_source
   TEXT`. Old-deployment safe via `ALTER TABLE ADD COLUMN`.
 - `run_autopilot.py` — per-trade OPEN/CLOSE emails REMOVED. New
@@ -304,12 +299,9 @@ top-5% rolling alert. Everything routes to `baldwetcoby@gmail.com`.
 - After: 1 daily recap + 0-5 high-conviction alerts = **~1-6/day**
 - Single inbox: `baldwetcoby@gmail.com` for everything
 
-**Confidence blend formula:**
+**Confidence formula:**
 ```
-confidence = 0.5 * raw_strategy_score
-           + 0.3 * minimax_strategy_score     (if present)
-           + 0.2 * minimax_overall_confidence (flipped if direction opposes bias)
-weights renormalise if MiniMax data absent (stub key → raw-only)
+confidence = raw_strategy_score   (source label = "raw")
 ```
 
 **Session buckets (ET, weekday):**
@@ -409,6 +401,49 @@ Safe to delete once the fix has run clean for a day or two.
 3. Claude reads this file automatically
 4. Say "lets continue building the futures app" and pick up from
    the current phase listed above
+
+### Strategy #29 — Liquidity Sweep & Reclaim (2026-05-11) ✅
+Added a new institutional liquidity sweep reversal strategy from
+@_market_decoded_ Instagram reel. Fades false breakouts at equal highs/lows.
+
+**Concept:**
+1. Identify equal highs (or lows) forming a visible liquidity pool
+2. Wait for price to sweep through (trapping breakout traders)
+3. Enter reversal when price reclaims back inside the range
+4. Stop above the sweep extreme + 0.2x ATR buffer
+5. ATR-based target (optimized per timeframe)
+
+**Files created/updated:**
+- `market_analyzer.py` — added `liquidity_sweep_reclaim` to STRATEGIES catalog (29th),
+  `_check_liquidity_sweep_reclaim()` checker with timeframe-optimized parameters,
+  `_sweep_side()` helper for both bull/bear sweeps, EMA50 trend filter on daily
+- `backtest_liquidity_sweep.py` — standalone comprehensive backtest script
+- `optimize_liquidity_sweep.py` — parameter sweep script (192 combos × 3 timeframes)
+
+**Optimized parameters (from 192-combo sweep over 25 years of GC=F data):**
+- 15m: lookback=10, tol=0.5×ATR, min_touches=2, target=3.0×ATR, no trend filter
+- 1h:  lookback=30, tol=0.3×ATR, min_touches=3, target=1.8×ATR, no trend filter
+- 1d:  lookback=10, tol=0.5×ATR, min_touches=2, target=1.8×ATR, EMA50 trend filter
+
+**Backtest results (GC=F, all available data):**
+- 15m (3 months, 5,831 bars): 238 trades, 35.3% WR, +$12,556 P&L, PF 1.36, Sharpe 1.99
+- 1h (2.5 years, 14,067 bars): 322 trades, 40.1% WR, +$4,817 P&L, PF 1.14, Sharpe 0.77
+- 1d (25 years, 6,449 bars): 143 trades, 51.0% WR, +$16,495 P&L, PF 2.06, Sharpe 3.26
+
+**Key insight:** The EMA50 trend filter on daily is transformative —
+filters out counter-trend shorts in gold's long uptrend eras, boosting
+daily from PF 1.03 → 2.06 and win rate from 37.5% → 51.0%.
+
+**Markets:** GC=F, SI=F, ES=F, NQ=F, CL=F
+**Live deployment:** SCP'd to adamserver, futures-static + futures-autopilot
+restarted. Now strategy #29 in the live catalog.
+
+**Backtest output files:**
+- `backtests/liquidity_sweep_GC_{15m,1h,1d}.json` — per-timeframe trade data
+- `backtests/equity_liquidity_sweep_GC_{15m,1h,1d}.png` — equity curves
+- `backtests/monthly_liquidity_sweep_GC_{15m,1h,1d}.png` — monthly P&L
+- `backtests/scatter_liquidity_sweep_GC_{15m,1h,1d}.png` — trade scatter
+- `backtests/liquidity_sweep_report.txt` — full text report (emailed to baldwetcoby)
 
 ## Update this file every session
 Update whenever: a phase is completed, new libraries are installed,
