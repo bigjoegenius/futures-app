@@ -44,6 +44,9 @@ from autopilot import AutoPilot
 # Shared module lives at ~/trading/trading_core/ — one level above this app folder
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from trading_core.confidence_tracker import ConfidenceTracker
+from trading_core.broker import PaperBroker, make_broker
+from trading_core.risk import RiskRegulator, RiskLimits
+from trading_core.futures_specs import MICRO_SPECS, micro_equivalent
 import news_provider
 import live_prices
 
@@ -477,11 +480,48 @@ def main():
     # Static: all 28 strategies enabled; AutoPilot: let AI decide (start with all)
     initial_enabled = list(DEFAULT_STRATEGIES) if args.portfolio == "static_all" else list(DEFAULT_STRATEGIES)
 
+    # ── Guarded mode for the autopilot portfolio ──
+    # The autopilot routes every trade through a Schwab-realistic PaperBroker
+    # (micros only, integer contracts, session-aware slippage, margin checks)
+    # and clears a RiskRegulator (daily-loss / drawdown / correlation /
+    # cooldown) before opening. The static_all portfolio stays unguarded so
+    # it keeps collecting data on every strategy regardless of profitability,
+    # per Joe's data-collection mandate.
+    broker = None
+    risk = None
+    if args.portfolio == "autopilot":
+        broker = PaperBroker(
+            starting_equity=args.balance, asset_class="futures",
+            allow_full_size_futures=False,  # $10k can only hold micros overnight
+        )
+        risk = RiskRegulator(
+            starting_equity=args.balance,
+            limits=RiskLimits(
+                max_daily_loss_pct=5.0,      # halt new entries at -5% intraday
+                max_drawdown_pct=12.0,        # halt at -12% peak-to-trough
+                max_concurrent_positions=3,   # $10k caps practical exposure
+                max_bucket_position_count=1,  # no ES+NQ+YM stacking
+                post_stop_cooldown_bars=8,    # 8 hours after a stop on 1h bars
+                post_target_cooldown_bars=2,
+                strategy_loss_streak_limit=3,
+                strategy_streak_cooldown_bars=24,
+            ),
+        )
+        log(f"GUARDED mode: micros-only, regulator active, "
+            f"5%/day + 12% drawdown halts, 1 position per correlation bucket")
+    else:
+        log(f"STATIC mode (unguarded): all {len(initial_enabled)} strategies "
+            f"always on, fractional contracts allowed for data collection only")
+
     engine = StrategyEngine(
         starting_balance=args.balance,
         risk_mode=args.risk,
         enabled_strategies=initial_enabled,
         on_trade_closed=on_close,
+        broker=broker,
+        risk=risk,
+        guarded=(args.portfolio == "autopilot"),
+        portfolio_tag=args.portfolio,
     )
     _wire_engine_open_callback(engine, on_open)
 

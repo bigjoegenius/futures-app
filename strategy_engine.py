@@ -20,8 +20,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sqlite3
+import sys
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
 from typing import Callable, Optional
@@ -32,8 +34,45 @@ import pandas as pd
 from futures_config import DB_PATH, FUTURES
 from market_analyzer import score_strategies, load_bars, atr, STRATEGIES
 
+# Shared trading_core (one level up). When None broker/regulator are passed
+# the engine falls back to its legacy direct-fill behavior (used by the
+# static data-collection worker). When they're passed (the autopilot path),
+# every entry routes through the Schwab-realistic PaperBroker and clears
+# the RiskRegulator before it opens.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from trading_core.broker import (
+    Broker, Order, Quote, Fill, PaperBroker, round_qty_futures, round_to_tick,
+)
+from trading_core.risk import RiskRegulator
+from trading_core.sessions import (
+    strategy_allowed_now, is_near_expiry, session_slippage_multiplier,
+)
+from trading_core.futures_specs import (
+    get_spec as get_micro_or_full_spec, MICRO_SPECS, micro_equivalent,
+)
+from trading_core.walkforward_gate import WalkforwardGate
+
 
 TRADE_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trade_log.json")
+
+# Strategies whose backtest expectancy is *negative* and which should never
+# fire in the live autopilot path. The static-all worker still runs them
+# for ongoing data collection (per Joe's mandate: keep collecting data on
+# every strategy on adamserver).
+LIVE_BLOCKED_STRATEGIES: set[str] = {
+    # Triple confluence is structurally too rare and too late on futures.
+    # The crypto-app version had -$1,345 net P&L; the futures-app port
+    # inherits the same fragility on a smaller sample.
+    "triple_confluence",
+}
+
+# Per-symbol live-blocked strategies (autopilot only).
+# macd_momentum on ES daily: 145 trades, 39.3% WR, -$4,094 net, max DD 65%.
+# Keep collecting data on it, but don't trade it live.
+LIVE_BLOCKED_PER_SYMBOL: dict[str, set[str]] = {
+    "ES=F":  {"macd_momentum"},
+    "MES=F": {"macd_momentum"},
+}
 
 
 # ─── Contract specs (point value, tick) ─────────────────────────────────
@@ -118,6 +157,11 @@ class StrategyEngine:
         risk_mode: str = "moderate",
         enabled_strategies: list[str] | None = None,
         on_trade_closed: Callable[[TradeReport], None] | None = None,
+        *,
+        broker: Broker | None = None,
+        risk: RiskRegulator | None = None,
+        guarded: bool = False,
+        portfolio_tag: str = "static",
     ):
         self.balance = float(starting_balance)
         self.starting_balance = float(starting_balance)
@@ -128,6 +172,18 @@ class StrategyEngine:
         self.on_trade_closed = on_trade_closed
         self.min_score_to_enter = 60.0
         self._last_entry_bar: dict[str, str] = {}
+
+        # ── New guarded path (autopilot only). Static-all worker leaves
+        # broker/risk None so it keeps collecting trade data on every
+        # strategy without margin / regulator gates getting in the way.
+        self.broker = broker
+        self.risk = risk
+        self.guarded = bool(guarded or (broker is not None and risk is not None))
+        self.portfolio_tag = portfolio_tag
+        self._block_reasons: dict[str, str] = {}  # diagnostics for the controller
+        # Walk-forward gate (~/trading/walkforward_gate.json). Permissive
+        # when the file is absent so static engines never get held up.
+        self._wf_gate = WalkforwardGate() if self.guarded else None
 
     # ── Config ─────────────────────────────────────────────────────────
     def set_risk(self, mode: str) -> None:
@@ -145,10 +201,19 @@ class StrategyEngine:
              live_price: Optional[float] = None) -> None:
         """Run one tick of the engine for one symbol.
 
+        Guarded mode (autopilot): every entry must clear the RiskRegulator,
+        the session gate, the expiry gate, and the live-blocked strategy
+        list before broker.submit() fills.
+
+        Unguarded mode (static-all worker): legacy behavior. Used for the
+        ongoing data-collection portfolio that runs every strategy on every
+        bar regardless of profitability.
+
         `live_price`, when provided, is used as the fill price for new market
         entries and widens the high/low envelope for stop/target checks so
         they can trigger mid-bar. Leave it None for backtests (walk-forward
-        replay must use only closed-bar data)."""
+        replay must use only closed-bar data).
+        """
         if df is None or len(df) < 60:
             return
         spec = CONTRACT_SPECS.get(symbol)
@@ -167,6 +232,7 @@ class StrategyEngine:
         high = max(bar_high, lp) if lp is not None else bar_high
         low = min(bar_low, lp) if lp is not None else bar_low
         now = df["datetime"].iloc[-1].isoformat() if "datetime" in df else datetime.now(timezone.utc).isoformat()
+        now_dt = self._parse_ts(now)
 
         # One entry per bar per symbol — without this, a 5-min step loop over
         # 1h bars re-opens identical trades when the bar already bracketed the target.
@@ -191,7 +257,16 @@ class StrategyEngine:
             return
         self._last_entry_bar[symbol] = now
 
-        scores = score_strategies(symbol, df, tf=timeframe, strategy_filter=self.enabled)
+        # ── Signal evaluation: lookahead-bias fix ──
+        # When a live_price is available, the latest df row is mid-formation.
+        # Score against bar i-1 (the last *closed* bar) so signals don't see
+        # data the live market hasn't printed yet.
+        if lp is not None and len(df) >= 61:
+            signal_df = df.iloc[:-1]
+        else:
+            signal_df = df
+
+        scores = score_strategies(symbol, signal_df, tf=timeframe, strategy_filter=self.enabled)
         candidates = []
         for sid, info in scores.items():
             if sid not in self.enabled:
@@ -205,13 +280,88 @@ class StrategyEngine:
         if not candidates:
             return
 
-        # pick the highest-scoring candidate
         candidates.sort(key=lambda kv: kv[1]["score"], reverse=True)
-        sid, info = candidates[0]
-        atr_val = float(info["signals"].get("atr", max(last * 0.01, spec["tick"] * 4)))
-        raw_score = float(info.get("score", 0.0))
-        self._open_position(symbol, sid, info["direction"].lower(), last, atr_val, now, spec,
-                            raw_score=raw_score)
+
+        # In guarded mode, walk candidates in score order and take the first
+        # one that clears all gates. Unguarded mode takes the top candidate.
+        for sid, info in candidates:
+            direction = info["direction"].lower()
+            if self.guarded:
+                ok, why = self._guarded_entry_allowed(symbol, sid, direction, now_dt)
+                if not ok:
+                    self._block_reasons[f"{symbol}:{sid}"] = why
+                    continue
+            atr_val = float(info["signals"].get("atr",
+                            max(last * 0.01, spec["tick"] * 4)))
+            raw_score = float(info.get("score", 0.0))
+            self._open_position(symbol, sid, direction, last, atr_val, now, spec,
+                                raw_score=raw_score)
+            break
+
+    @staticmethod
+    def _parse_ts(ts: str) -> datetime:
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except Exception:
+            return datetime.now(timezone.utc)
+
+    def _guarded_entry_allowed(self, symbol: str, strategy: str,
+                                direction: str, ts: datetime) -> tuple[bool, str]:
+        """Run a candidate through every gate. Returns (allowed, reason).
+
+        Order of cheap-checks-first:
+          1. Live-blocked strategy list (free)
+          2. Session gating (free)
+          3. Expiry gating (free)
+          4. Risk regulator (cheap)
+          5. Broker buying-power (touched by submit())
+        """
+        # 1. Permanent live-block list
+        if strategy in LIVE_BLOCKED_STRATEGIES:
+            return False, f"strategy '{strategy}' is permanently live-blocked"
+        sym_blocked = LIVE_BLOCKED_PER_SYMBOL.get(symbol, set())
+        if strategy in sym_blocked:
+            return False, f"strategy '{strategy}' is live-blocked on {symbol}"
+
+        # 1b. Walk-forward gate — has this strategy + symbol passed
+        # out-of-sample validation? Permissive when gate file is absent.
+        if self._wf_gate is not None:
+            ok, why = self._wf_gate.is_approved(
+                app="futures", strategy=strategy, symbol=symbol,
+            )
+            if not ok:
+                return False, f"walk-forward gate: {why}"
+
+        # 2. Session gating
+        allowed_now, why_session = strategy_allowed_now(strategy, ts)
+        if not allowed_now:
+            return False, why_session
+
+        # 3. Expiry gating — block new entries within 5 days of front-month roll
+        if is_near_expiry(symbol, ts, threshold_days=5):
+            return False, f"{symbol} within 5d of front-month expiry"
+
+        # 4. Risk regulator — daily loss / drawdown / correlation / cooldown
+        if self.risk is not None:
+            # Approximate intent_notional from price * point_value (1-contract proxy).
+            mspec = get_micro_or_full_spec(symbol)
+            ref_price = self._last_price_hint.get(symbol, 0.0) if hasattr(self, "_last_price_hint") else 0.0
+            if ref_price <= 0 or mspec is None:
+                # Conservatively allow when the proxy can't be computed; the
+                # broker will still reject if buying power is insufficient.
+                intent_notional = 0.0
+            else:
+                intent_notional = ref_price * mspec.point_value
+            ok, why = self.risk.allow_entry(
+                symbol=symbol, strategy=strategy, intent_notional=intent_notional,
+            )
+            if not ok:
+                return False, why
+
+        return True, "ok"
 
     # ── Confidence estimation ─────────────────────────────────────────
     def _estimate_confidence(self, strategy: str, direction: str,
@@ -234,41 +384,114 @@ class StrategyEngine:
         target_mult = float(scfg.get("target_atr_mult", 1.8))
         stop_dist = max(atr_val * stop_mult, spec["tick"] * 8)
         target_dist = atr_val * target_mult if target_mult >= 1.0 else stop_dist * target_mult
+        # Round stop/target to ticks so paper matches what Schwab actually accepts
         if direction == "long":
-            stop = price - stop_dist
-            target = price + target_dist
+            stop = round_to_tick(price - stop_dist, spec["tick"], direction=-1)
+            target = round_to_tick(price + target_dist, spec["tick"], direction=1)
         else:
-            stop = price + stop_dist
-            target = price - target_dist
+            stop = round_to_tick(price + stop_dist, spec["tick"], direction=1)
+            target = round_to_tick(price - target_dist, spec["tick"], direction=-1)
 
         risk_dollars = self.balance * RISK_MODES[self.risk_mode]
         # $ loss per contract if stop hits
         loss_per_contract = stop_dist * spec["point_value"]
         if loss_per_contract <= 0:
             return
-        contracts = risk_dollars / loss_per_contract
-        # Round down to nearest 0.1 contracts (fractional allowed for paper)
-        contracts = max(round(contracts, 1), 0.1)
+        contracts_raw = risk_dollars / loss_per_contract
 
-        # Apply slippage on entry
+        # ── Guarded mode: route through the broker. Integer contracts only.
+        if self.guarded and self.broker is not None:
+            qty = round_qty_futures(contracts_raw)
+            if qty <= 0:
+                # Sub-1-contract risk on this signal — skip rather than fake a
+                # fractional fill that Schwab will never accept.
+                self._block_reasons[f"{symbol}:{strategy}"] = (
+                    f"qty_too_small (risk ${risk_dollars:.0f} would need "
+                    f"{contracts_raw:.2f} contracts; min is 1)"
+                )
+                return
+            quote = Quote(
+                symbol=symbol, bid=price - spec["tick"], ask=price + spec["tick"],
+                last=price, ts=self._parse_ts(ts),
+            )
+            order = Order(
+                symbol=symbol, side="buy" if direction == "long" else "sell",
+                qty=qty, asset_class="futures", order_type="market",
+                stop_price=stop, target_price=target, strategy=strategy,
+                intent_ts=self._parse_ts(ts),
+            )
+            fill = self.broker.submit(order, quote)
+            if not fill.accepted:
+                self._block_reasons[f"{symbol}:{strategy}"] = (
+                    f"broker rejected: {fill.rejection_reason}"
+                )
+                return
+            fill_price = fill.fill_price
+            contracts = float(fill.qty)
+            confidence, conf_source = self._estimate_confidence(
+                strategy, direction, raw_score)
+            self.positions[symbol] = Position(
+                symbol=symbol, strategy=strategy, direction=direction,
+                entry_price=fill_price, stop_price=stop, target_price=target,
+                contracts=contracts, entry_time=ts, atr_at_entry=atr_val,
+                confidence=confidence, confidence_source=conf_source,
+            )
+            # Inform regulator + persist open trade for crash recovery
+            if self.risk is not None:
+                notional = contracts * fill_price * spec["point_value"]
+                self.risk.record_open(symbol=symbol, notional=notional)
+            self._persist_open_position(self.positions[symbol], spec)
+            return
+
+        # ── Legacy / static-collector path (no broker, no regulator).
+        # Round down to nearest 0.1 contracts (fractional allowed for paper
+        # data collection — NOT for live execution).
+        contracts = max(round(contracts_raw, 1), 0.1)
+        # Apply legacy fixed-slippage on entry
         slip = SLIPPAGE_TICKS * spec["tick"]
         fill_price = price + slip if direction == "long" else price - slip
-
         confidence, conf_source = self._estimate_confidence(strategy, direction, raw_score)
-
         self.positions[symbol] = Position(
-            symbol=symbol,
-            strategy=strategy,
-            direction=direction,
-            entry_price=fill_price,
-            stop_price=stop,
-            target_price=target,
-            contracts=contracts,
-            entry_time=ts,
-            atr_at_entry=atr_val,
-            confidence=confidence,
-            confidence_source=conf_source,
+            symbol=symbol, strategy=strategy, direction=direction,
+            entry_price=fill_price, stop_price=stop, target_price=target,
+            contracts=contracts, entry_time=ts, atr_at_entry=atr_val,
+            confidence=confidence, confidence_source=conf_source,
         )
+        # Even in legacy mode, persist the open trade so a crash doesn't
+        # orphan it. The static engine never crash-recovers fills, but the
+        # JSON snapshot is useful for the controller / public viewer.
+        self._persist_open_position(self.positions[symbol], spec)
+
+    def _persist_open_position(self, pos: Position, spec: dict) -> None:
+        """Write the open position to trade_log.json immediately on open,
+        so a process crash between open and close doesn't lose the trade.
+        Closed trades overwrite this entry via _persist_trade."""
+        try:
+            log = []
+            if os.path.exists(TRADE_LOG_PATH):
+                with open(TRADE_LOG_PATH) as f:
+                    raw = f.read().strip()
+                    if raw:
+                        log = json.loads(raw)
+            # Remove any prior open snapshot for this symbol + entry_time
+            log = [t for t in log if not (
+                t.get("status") == "open"
+                and t.get("symbol") == pos.symbol
+                and t.get("entry_time") == pos.entry_time
+            )]
+            log.append({
+                "symbol": pos.symbol, "strategy": pos.strategy,
+                "direction": pos.direction, "entry_time": pos.entry_time,
+                "entry_price": pos.entry_price, "stop_price": pos.stop_price,
+                "target_price": pos.target_price, "contracts": pos.contracts,
+                "atr_at_entry": pos.atr_at_entry, "confidence": pos.confidence,
+                "confidence_source": pos.confidence_source, "status": "open",
+                "portfolio": self.portfolio_tag,
+            })
+            with open(TRADE_LOG_PATH, "w") as f:
+                json.dump(log, f, indent=2, default=str)
+        except Exception as e:
+            print(f"[strategy_engine] open-position persist failed: {e}")
 
     def _manage_position(self, pos: Position, bar_high, bar_low, bar_close, ts, spec):
         """Check if stop or target was hit on this bar. Close if so."""
@@ -345,16 +568,59 @@ class StrategyEngine:
                 self._close_position(pos, last, datetime.now(timezone.utc).isoformat(), reason, spec)
 
     def _close_position(self, pos: Position, exit_price: float, ts: str, reason: str, spec: dict):
-        slip = SLIPPAGE_TICKS * spec["tick"]
-        fill = exit_price - slip if pos.direction == "long" else exit_price + slip
-
-        if pos.direction == "long":
-            gross = (fill - pos.entry_price) * spec["point_value"] * pos.contracts
+        if self.guarded and self.broker is not None:
+            # Route the close through the broker. Reverse-side market order
+            # that flattens the position; broker realizes the PnL on its
+            # internal book.
+            qty = int(round(pos.contracts))
+            if qty < 1:
+                qty = 1   # safety: at least 1 contract on flatten
+            quote = Quote(
+                symbol=pos.symbol,
+                bid=exit_price - spec["tick"], ask=exit_price + spec["tick"],
+                last=exit_price, ts=self._parse_ts(ts),
+            )
+            close_side = "sell" if pos.direction == "long" else "buy"
+            order = Order(
+                symbol=pos.symbol, side=close_side, qty=qty,
+                asset_class="futures", order_type="market",
+                strategy=pos.strategy, intent_ts=self._parse_ts(ts),
+            )
+            fill = self.broker.submit(order, quote)
+            if fill.accepted:
+                fill_price = fill.fill_price
+                commission = fill.commission * 2  # round-trip (entry + exit)
+                if pos.direction == "long":
+                    gross = (fill_price - pos.entry_price) * spec["point_value"] * pos.contracts
+                else:
+                    gross = (pos.entry_price - fill_price) * spec["point_value"] * pos.contracts
+                pnl = gross - commission
+                fees = commission
+            else:
+                # Broker rejected the close (shouldn't happen — flattening
+                # never requires new buying power). Fall through to legacy
+                # math but log so we can audit.
+                self._block_reasons[f"{pos.symbol}:close:{pos.strategy}"] = (
+                    f"close rejected: {fill.rejection_reason}"
+                )
+                slip = SLIPPAGE_TICKS * spec["tick"]
+                fill_price = exit_price - slip if pos.direction == "long" else exit_price + slip
+                if pos.direction == "long":
+                    gross = (fill_price - pos.entry_price) * spec["point_value"] * pos.contracts
+                else:
+                    gross = (pos.entry_price - fill_price) * spec["point_value"] * pos.contracts
+                fees = FEE_PER_CONTRACT_PER_SIDE * 2 * pos.contracts
+                pnl = gross - fees
         else:
-            gross = (pos.entry_price - fill) * spec["point_value"] * pos.contracts
+            slip = SLIPPAGE_TICKS * spec["tick"]
+            fill_price = exit_price - slip if pos.direction == "long" else exit_price + slip
+            if pos.direction == "long":
+                gross = (fill_price - pos.entry_price) * spec["point_value"] * pos.contracts
+            else:
+                gross = (pos.entry_price - fill_price) * spec["point_value"] * pos.contracts
+            fees = FEE_PER_CONTRACT_PER_SIDE * 2 * pos.contracts
+            pnl = gross - fees
 
-        fees = FEE_PER_CONTRACT_PER_SIDE * 2 * pos.contracts
-        pnl = gross - fees
         pnl_pct = (pnl / self.balance) * 100 if self.balance else 0.0
         self.balance += pnl
 
@@ -365,7 +631,7 @@ class StrategyEngine:
             entry_time=pos.entry_time,
             entry_price=pos.entry_price,
             exit_time=ts,
-            exit_price=fill,
+            exit_price=fill_price,
             stop_price=pos.stop_price,
             target_price=pos.target_price,
             contracts=pos.contracts,
@@ -379,6 +645,18 @@ class StrategyEngine:
         )
         self.closed.append(tr)
         self._persist_trade(tr)
+
+        # Notify regulator AFTER the close so cooldowns + streak counters
+        # have current data when the next bar's entry attempt arrives.
+        if self.risk is not None:
+            notional = pos.contracts * pos.entry_price * spec["point_value"]
+            self.risk.record_close(
+                symbol=pos.symbol, strategy=pos.strategy,
+                notional=notional, pnl=pnl, reason=reason,
+            )
+            self.risk.record_equity(self.balance)
+            self.risk.advance_bar()
+
         del self.positions[pos.symbol]
         if self.on_trade_closed:
             try:

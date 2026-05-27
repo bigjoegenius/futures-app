@@ -34,10 +34,18 @@ from typing import Callable, Optional
 
 from futures_config import DB_PATH, FUTURES
 from market_analyzer import STRATEGIES, get_market_overview
-from strategy_engine import StrategyEngine, RISK_MODES, DEFAULT_STRATEGIES
+from strategy_engine import (
+    StrategyEngine, RISK_MODES, DEFAULT_STRATEGIES,
+    LIVE_BLOCKED_STRATEGIES, LIVE_BLOCKED_PER_SYMBOL,
+)
 
 
-CONTROLLABLE_STRATEGIES = list(STRATEGIES.keys())
+# Strategies the AI can choose between. Live-blocked strategies (proven
+# negative expectancy on this account) are filtered out so the AI can't
+# re-enable them. The static-all data-collection worker still runs them.
+CONTROLLABLE_STRATEGIES = [
+    sid for sid in STRATEGIES.keys() if sid not in LIVE_BLOCKED_STRATEGIES
+]
 
 
 class AutoPilot:
@@ -85,7 +93,9 @@ class AutoPilot:
     def run_once(self) -> dict:
         overview = get_market_overview()
         trades_tail = self.engine.closed[-15:]
-        decision = self._ask_ai(overview, trades_tail)
+        strategy_stats = self._rolling_strategy_stats()
+        decision = self._ask_ai(overview, trades_tail, strategy_stats)
+        decision = self._sanitize_decision(decision)
         self._apply(decision)
         self._log(decision)
         self.last_decision = decision
@@ -96,13 +106,48 @@ class AutoPilot:
                 pass
         return decision
 
+    # ── Rolling per-strategy stats (fed to the AI so it can correct itself) ─
+    def _rolling_strategy_stats(self, window: int = 30) -> dict:
+        """Compute rolling per-strategy WR + net PnL from the last `window`
+        closed trades. Claude makes better calls when it can see which
+        strategies are actually working *right now* vs the static backtest
+        catalog."""
+        recent = self.engine.closed[-window:] if hasattr(self.engine, "closed") else []
+        stats: dict[str, dict] = {}
+        for t in recent:
+            s = stats.setdefault(t.strategy, {"n": 0, "wins": 0, "pnl": 0.0})
+            s["n"] += 1
+            if t.pnl_dollars > 0:
+                s["wins"] += 1
+            s["pnl"] += float(t.pnl_dollars)
+        for s in stats.values():
+            s["wr"] = round(100 * s["wins"] / s["n"], 1) if s["n"] else 0.0
+            s["pnl"] = round(s["pnl"], 2)
+        return stats
+
+    def _sanitize_decision(self, decision: dict) -> dict:
+        """Strip any choice that would re-enable a live-blocked strategy.
+        Last line of defense if the AI ignores the prompt rules."""
+        if not isinstance(decision, dict):
+            return decision
+        enabled = decision.get("enabled") or []
+        enabled = [s for s in enabled if s in CONTROLLABLE_STRATEGIES]
+        decision["enabled"] = enabled
+        strats = decision.get("strategy_confidences") or {}
+        if isinstance(strats, dict):
+            decision["strategy_confidences"] = {
+                k: v for k, v in strats.items() if k in CONTROLLABLE_STRATEGIES
+            }
+        return decision
+
     # ── AI / fallback ──────────────────────────────────────────────────
-    def _ask_ai(self, overview: dict, trades_tail: list) -> dict:
+    def _ask_ai(self, overview: dict, trades_tail: list,
+                strategy_stats: dict | None = None) -> dict:
         claude_bin = os.environ.get("CLAUDE_BIN", "/usr/bin/claude")
         if not os.path.exists(claude_bin):
             return self._local_decision(overview, reason=f"claude CLI not found at {claude_bin}")
 
-        prompt = self._build_prompt(overview, trades_tail)
+        prompt = self._build_prompt(overview, trades_tail, strategy_stats or {})
         # Strip ANTHROPIC_API_KEY so the CLI always uses the OAuth subscription
         # token and never falls back to metered API spend.
         cli_env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
@@ -123,7 +168,9 @@ class AutoPilot:
         except Exception as e:
             return self._local_decision(overview, reason=f"claude CLI error: {e}")
 
-    def _build_prompt(self, overview: dict, trades_tail: list) -> str:
+    def _build_prompt(self, overview: dict, trades_tail: list,
+                      strategy_stats: dict | None = None) -> str:
+        strategy_stats = strategy_stats or {}
         snap = {}
         for sym, info in overview.items():
             if "error" in info:
@@ -159,13 +206,57 @@ class AutoPilot:
 
         session = self.engine.get_session_report()
 
-        return f"""You are the autopilot AI for a US futures day-trading / swing paper account spanning 18 contracts
-(indexes ES/NQ/YM/RTY · energy CL/NG · metals GC/SI/HG · bonds ZB/ZN · grains ZC/ZS/ZW · softs KC/SB/CT · cattle LE).
+        # Rolling stats block — Claude uses this to overrule the static
+        # backtest catalog when reality is diverging from history.
+        if strategy_stats:
+            stat_lines = []
+            for sid, s in sorted(strategy_stats.items(), key=lambda kv: kv[1]["pnl"], reverse=True):
+                stat_lines.append(
+                    f"  {sid:<25} n={s['n']:>2}  WR={s['wr']:>5.1f}%  PnL=${s['pnl']:+8.2f}"
+                )
+            rolling_block = "\n".join(stat_lines)
+        else:
+            rolling_block = "  (no closed trades yet)"
 
-Available strategies ({len(CONTROLLABLE_STRATEGIES)} total — enable any subset):
+        # Blocked strategies — explicit so the model can't accidentally pick them
+        blocked_block = (
+            f"  Permanently live-blocked (do NOT enable): {sorted(LIVE_BLOCKED_STRATEGIES)}\n"
+            f"  Per-symbol live-blocked: {LIVE_BLOCKED_PER_SYMBOL}"
+        )
+
+        return f"""You are the autopilot AI for Joe's $10k Schwab futures paper account.
+
+EXECUTION REALITY (changed 2026-05-27):
+- All live trades route through a Schwab-realistic PaperBroker that
+  enforces MICROS ONLY: MES, MNQ, MYM, M2K, MGC, MCL, SIL. Full-size
+  ES/NQ/CL/GC etc. ARE REJECTED at the broker level — your decisions
+  on those symbols only affect what data we collect, not what trades.
+- A RiskRegulator gates every entry. It blocks new positions when:
+    * daily loss reaches -5%
+    * peak-to-trough drawdown reaches -12%
+    * a correlation bucket (e.g. us_equity_index = ES/NQ/YM/RTY/micros)
+      already has 1 position open — no stacking same-direction risk
+    * a strategy has lost 3 in a row (24-bar cooldown)
+    * post-stop cooldown (8 bars) or post-target cooldown (2 bars)
+- RTH-only strategies (orb_15, vwap_pullback, rth_reversal,
+  overnight_gap) are session-gated automatically — they only fire
+  9:30-16:00 ET regardless of what you enable.
+
+YOUR CONTROL (the levers you actually move):
+1. Which strategies to enable for the next hour (subset of {len(CONTROLLABLE_STRATEGIES)})
+2. Risk mode: conservative (0.5% per trade) / moderate (1%) / aggressive (2%)
+3. Optional high-conviction trade for an email alert
+
+Available strategies (enable any subset):
 {strategy_catalog}
 
-Current session state:
+BLOCKED — do not enable:
+{blocked_block}
+
+ROLLING PER-STRATEGY PERFORMANCE (last 30 closed trades):
+{rolling_block}
+
+Session state:
 - balance: ${session['balance']:.2f}  (started at ${session['starting_balance']:.2f})
 - total pnl pct: {session['total_pnl_pct']:.2f}%
 - trades: {session['trades']}  win rate: {session['win_rate']:.1f}%
@@ -178,32 +269,30 @@ Market snapshot (only strategies with score > 0 shown per symbol):
 Recent closed trades:
 {json.dumps(trade_rows, indent=2)[:1500]}
 
-Decide:
-  1. strategies.<name>.enable: true/false, strategies.<name>.confidence: 0-100, strategies.<name>.reason: one sentence
-  2. risk_mode: "conservative" | "moderate" | "aggressive"
-  3. overall_confidence: 0-100
-  4. summary: 1-2 sentence market outlook
-  5. high_conviction_trade: if a single setup stands out, include it (symbol, strategy, direction, entry_price, stop_loss, take_profit, confidence_pct, reasoning)
+Decision rules:
+- Heed the rolling per-strategy stats. If a strategy has 3+ trades and
+  negative PnL in the rolling window, disable it even if backtest WR is high.
+- Macro events (FOMC, WASDE, EIA): prefer to stay flat unless confidence ≥ 80.
+- Bond strategies favor the 3 days after FOMC. Grains: seasonal_harvest in
+  Sep/Oct; wasde_react only on WASDE release days.
+- Conservative when uncertain — sitting flat with 0 strategies enabled is
+  a valid (sometimes the best) decision.
+- Output is strict JSON, no markdown, no comments.
 
-Rules of thumb:
-- Macro events (FOMC, WASDE, EIA): prefer to stay flat until resolution unless confidence is very high
-- Index ORB strategies only make sense during US RTH (09:30-16:00 ET)
-- Grain strategies favor Sep/Oct for seasonal_harvest, and the day of WASDE for wasde_react
-- Bond strategies favor the 3 days after FOMC
-- If a strategy has lost 3 straight in recent trades, disable it for 1 cycle
-
-Return ONLY a JSON object, no markdown. Exact shape:
+Return ONLY this JSON shape (every required key present):
 {{
   "strategies": {{
-    "ema_cross": {{"enable": true, "confidence": 65, "reason": "..."}},
-    ...
+    "ema_cross":              {{"enable": true,  "confidence": 65, "reason": "..."}},
+    "macd_momentum":          {{"enable": false, "confidence": 30, "reason": "..."}},
+    "liquidity_sweep_reclaim":{{"enable": true,  "confidence": 80, "reason": "..."}}
+    // … one entry per strategy you have an opinion on; missing entries default to disabled
   }},
   "risk_mode": "moderate",
   "overall_confidence": 72,
-  "summary": "...",
+  "summary": "1-2 sentence outlook on the next hour",
   "high_conviction_trade": {{
     "exists": false,
-    "symbol": "",
+    "symbol": "MES=F",   // must be a MICRO if exists=true
     "strategy": "",
     "direction": "LONG",
     "entry_price": "",
@@ -213,9 +302,6 @@ Return ONLY a JSON object, no markdown. Exact shape:
     "reasoning": ""
   }}
 }}
-
-Fallback: if you don't want to use the full JSON shape, the legacy form also works:
-{{"enabled": ["ema_cross", "macd_momentum"], "risk_mode": "moderate", "reasoning": "..."}}
 """
 
     def _parse_decision(self, text: str, overview: dict) -> dict:
@@ -266,20 +352,47 @@ Fallback: if you don't want to use the full JSON shape, the legacy form also wor
         }
 
     def _local_decision(self, overview: dict, reason: str) -> dict:
-        # Enable strategies whose best score across symbols is high enough.
+        """Fallback when Claude CLI is unreachable. The OLD fallback would
+        enable any strategy with score≥50, which included the
+        permanently-losing macd_momentum-on-ES path. The NEW fallback is
+        conservative: only enable strategies that (a) aren't in the
+        live-blocked list and (b) currently have a high score AND a
+        positive recent PnL.
+        """
+        # Best score per strategy across symbols
         best_per_strat: dict[str, float] = {}
         for snap in overview.values():
             if "error" in snap:
                 continue
             for sid, info in snap.get("strategies", {}).items():
-                best_per_strat[sid] = max(best_per_strat.get(sid, 0.0), info.get("score", 0.0))
-        enabled = [sid for sid, score in best_per_strat.items() if score >= 50]
+                best_per_strat[sid] = max(best_per_strat.get(sid, 0.0),
+                                           info.get("score", 0.0))
+
+        # Rolling PnL filter — disable anything bleeding lately
+        recent_stats = self._rolling_strategy_stats(window=30)
+        bleeding = {sid for sid, s in recent_stats.items()
+                    if s["n"] >= 3 and s["pnl"] <= 0}
+
+        enabled = []
+        for sid, score in best_per_strat.items():
+            if sid not in CONTROLLABLE_STRATEGIES:
+                continue
+            if sid in bleeding:
+                continue
+            if score >= 60:
+                enabled.append(sid)
+
         if not enabled:
-            enabled = list(DEFAULT_STRATEGIES)[:3]
+            # Fail closed — sit flat rather than spray-and-pray
+            enabled = []
+
         return {
             "enabled": enabled,
-            "risk_mode": "moderate",
-            "reasoning": f"Local fallback ({reason}). Enabled strategies with score>=50.",
+            "risk_mode": "conservative",
+            "reasoning": (f"Local fallback ({reason}). Conservative mode: "
+                          f"only enabling score≥60 strategies that aren't "
+                          f"losing in the rolling window. "
+                          f"Excluded bleeding: {sorted(bleeding)}."),
             "source": "local",
             "ts": datetime.now(timezone.utc).isoformat(),
         }
