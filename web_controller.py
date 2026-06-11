@@ -113,6 +113,10 @@ ALLOWED_SERVICES = {
     "futures-live-prices": "Live price poller",
     "futures-analyzer":    "Market analyzer",
     "futures-collector":   "yfinance candle collector",
+    "forex-live-prices":   "Forex Schwab quote poller",
+    "forex-static":        "Forex static engine (11 strategies × 7 pairs)",
+    "forex-adaptive":      "Forex adaptive book (backtest winners)",
+    "forex-collector":     "Forex yfinance candle collector",
 }
 
 

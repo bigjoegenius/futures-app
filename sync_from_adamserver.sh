@@ -16,6 +16,7 @@ CRYPTO_DIR="$HOME/trading/crypto-app"
 CATALYST_DIR="$HOME/trading/catalyst-trader"
 OPTIONS_DIR="$HOME/trading/catalyst-options"
 ETF_DIR="$HOME/trading/catalyst-etf"
+FOREX_DIR="$HOME/trading/forex-app"
 LOG="$LOCAL_DIR/sync.log"
 LOCK_DIR="$LOCAL_DIR/.sync.lock.d"
 REMOTE_FUTURES="adamserver:/home/joe/futures-app/futures.db"
@@ -23,6 +24,7 @@ REMOTE_CRYPTO="adamserver:/home/joe/crypto-app/prices.db"
 REMOTE_CATALYST="adamserver:/home/joe/catalyst-trader/catalyst.db"
 REMOTE_OPTIONS="adamserver:/home/joe/catalyst-options/options.db"
 REMOTE_ETF="adamserver:/home/joe/catalyst-etf/etf.db"
+REMOTE_FOREX="adamserver:/home/joe/forex-app/forex.db"
 # Reverse push (Mac → adamserver): the public viewer's Reports tab serves
 # stock dossiers + publishable reports that are GENERATED on this Mac. Source
 # folders live under the iCloud "Created by claude" hub; dest dirs are created
@@ -109,6 +111,18 @@ trap '/bin/rmdir "$LOCK_DIR" 2>/dev/null' EXIT
         "$REMOTE_ETF" "$ETF_DIR/etf.db" 2>&1
     rc_etf=$?
 
+    # forex-app/forex.db — 7 majors, yfinance candles + Schwab live + paper books
+    echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] -- forex.db --"
+    if [ -d "$FOREX_DIR" ]; then
+        /usr/bin/rsync -avz --partial --stats \
+            -e 'ssh -o ConnectTimeout=10 -o BatchMode=yes' \
+            "$REMOTE_FOREX" "$FOREX_DIR/forex.db" 2>&1
+        rc_forex=$?
+    else
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] forex-app dir missing, skipping forex.db"
+        rc_forex=0
+    fi
+
     # ── Reverse push: dossiers + publishable reports → adamserver ─────────
     echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] -- push reports (dossiers + reviews) --"
     rc_push_doss=0; rc_push_rev=0
@@ -147,8 +161,8 @@ trap '/bin/rmdir "$LOCK_DIR" 2>/dev/null' EXIT
         echo "  (Created-by-Claude folder not found — skipping reports push)"
     fi
 
-    rc=$(( rc_futures | rc_crypto | rc_catalyst | rc_options | rc_etf ))
-    echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] ---- sync done (futures=$rc_futures crypto=$rc_crypto catalyst=$rc_catalyst options=$rc_options etf=$rc_etf push_doss=$rc_push_doss push_rev=$rc_push_rev) ----"
+    rc=$(( rc_futures | rc_crypto | rc_catalyst | rc_options | rc_etf | rc_forex ))
+    echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] ---- sync done (futures=$rc_futures crypto=$rc_crypto catalyst=$rc_catalyst options=$rc_options etf=$rc_etf forex=$rc_forex push_doss=$rc_push_doss push_rev=$rc_push_rev) ----"
 } >> "$LOG" 2>&1
 
 # Keep log under ~2000 lines
