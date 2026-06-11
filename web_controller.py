@@ -116,6 +116,7 @@ ALLOWED_SERVICES = {
     "forex-live-prices":   "Forex Schwab quote poller",
     "forex-static":        "Forex static engine (11 strategies × 7 pairs)",
     "forex-adaptive":      "Forex adaptive book (backtest winners)",
+    "forex-reels":         "Forex reels book (3 IG strategies)",
     "forex-collector":     "Forex yfinance candle collector",
 }
 
