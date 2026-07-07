@@ -50,8 +50,9 @@ SNAP_DIR="/tmp/mac-sync-snap"
 #   forex    — forex-app majors candles + paper books
 #   fable    — fable-trader 6-book strategy suite
 #   pumpfun  — pumpfun-trader 💩COIN screener + $10k paper book
-DB_NAMES=(futures crypto catalyst options etf forex fable pumpfun)
-DB_FILES=(futures.db prices.db catalyst.db options.db etf.db forex.db fable.db pumpfun.db)
+#   lab      — strategy-lab 3 research-survivor books (dip/TOM/donchian)
+DB_NAMES=(futures crypto catalyst options etf forex fable pumpfun lab)
+DB_FILES=(futures.db prices.db catalyst.db options.db etf.db forex.db fable.db pumpfun.db lab.db)
 DB_REMOTE=(
     /home/joe/futures-app/futures.db
     /home/joe/crypto-app/prices.db
@@ -61,10 +62,12 @@ DB_REMOTE=(
     /home/joe/forex-app/forex.db
     /home/joe/fable-trader/fable.db
     /home/joe/pumpfun-trader/pumpfun.db
+    /home/joe/strategy-lab/lab.db
 )
 FABLE_DIR="$HOME/trading/fable-trader"
 PUMPFUN_DIR="$HOME/trading/pumpfun-trader"
-DB_DEST=("$LOCAL_DIR" "$CRYPTO_DIR" "$CATALYST_DIR" "$OPTIONS_DIR" "$ETF_DIR" "$FOREX_DIR" "$FABLE_DIR" "$PUMPFUN_DIR")
+LAB_DIR="$HOME/trading/strategy-lab"
+DB_DEST=("$LOCAL_DIR" "$CRYPTO_DIR" "$CATALYST_DIR" "$OPTIONS_DIR" "$ETF_DIR" "$FOREX_DIR" "$FABLE_DIR" "$PUMPFUN_DIR" "$LAB_DIR")
 
 # Reverse push (Mac → adamserver): the public viewer's Reports tab serves
 # stock dossiers + publishable reports that are GENERATED on this Mac. Source
@@ -220,6 +223,16 @@ PYEOF
     if [ -d "$CREATED_DIR" ]; then
         /usr/bin/ssh -o ConnectTimeout=10 -o BatchMode=yes adamserver \
             'mkdir -p /home/joe/reports/dossiers/sources /home/joe/reports/reviews' 2>&1
+
+        # iCloud evicts these Desktop files to dataless placeholders when idle,
+        # so the *.pdf glob below (and rsync) silently see nothing and skip the
+        # push. Force them local first. (2026-06-21: the dossier push had been
+        # silently skipping every run since 06-04 for exactly this reason.)
+        for SRC in "$DOSSIERS_SRC" "$REVIEWS_SRC" "$BACKTESTS_SRC"; do
+            [ -d "$SRC" ] && /usr/bin/find "$SRC" -type f \
+                \( -name '*.pdf' -o -name '*.md' -o -name '*.docx' -o -name '*.html' \) \
+                -exec /usr/bin/brctl download {} + 2>/dev/null
+        done
 
         # Dossiers: PDFs + their .md sources only. --delete mirrors removals,
         # guarded by a non-empty check so an unmounted/empty iCloud folder
