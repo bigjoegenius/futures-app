@@ -51,8 +51,9 @@ SNAP_DIR="/tmp/mac-sync-snap"
 #   fable    — fable-trader 6-book strategy suite
 #   pumpfun  — pumpfun-trader 💩COIN screener + $10k paper book
 #   lab      — strategy-lab 3 research-survivor books (dip/TOM/donchian)
-DB_NAMES=(futures crypto catalyst options etf forex fable pumpfun lab)
-DB_FILES=(futures.db prices.db catalyst.db options.db etf.db forex.db fable.db pumpfun.db lab.db)
+#   wnba     — wnba-props 3 player-prop books vs Kalshi
+DB_NAMES=(futures crypto catalyst options etf forex fable pumpfun lab wnba)
+DB_FILES=(futures.db prices.db catalyst.db options.db etf.db forex.db fable.db pumpfun.db lab.db props.db)
 DB_REMOTE=(
     /home/joe/futures-app/futures.db
     /home/joe/crypto-app/prices.db
@@ -63,11 +64,13 @@ DB_REMOTE=(
     /home/joe/fable-trader/fable.db
     /home/joe/pumpfun-trader/pumpfun.db
     /home/joe/strategy-lab/lab.db
+    /home/joe/wnba-props/props.db
 )
 FABLE_DIR="$HOME/trading/fable-trader"
 PUMPFUN_DIR="$HOME/trading/pumpfun-trader"
 LAB_DIR="$HOME/trading/strategy-lab"
-DB_DEST=("$LOCAL_DIR" "$CRYPTO_DIR" "$CATALYST_DIR" "$OPTIONS_DIR" "$ETF_DIR" "$FOREX_DIR" "$FABLE_DIR" "$PUMPFUN_DIR" "$LAB_DIR")
+WNBA_DIR="$HOME/trading/wnba-props"
+DB_DEST=("$LOCAL_DIR" "$CRYPTO_DIR" "$CATALYST_DIR" "$OPTIONS_DIR" "$ETF_DIR" "$FOREX_DIR" "$FABLE_DIR" "$PUMPFUN_DIR" "$LAB_DIR" "$WNBA_DIR")
 
 # Reverse push (Mac → adamserver): the public viewer's Reports tab serves
 # stock dossiers + publishable reports that are GENERATED on this Mac. Source
