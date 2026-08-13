@@ -52,8 +52,9 @@ SNAP_DIR="/tmp/mac-sync-snap"
 #   pumpfun  — pumpfun-trader 💩COIN screener + $10k paper book
 #   lab      — strategy-lab 3 research-survivor books (dip/TOM/donchian)
 #   wnba     — wnba-props 3 player-prop books vs Kalshi
-DB_NAMES=(futures crypto catalyst options etf forex fable pumpfun lab wnba)
-DB_FILES=(futures.db prices.db catalyst.db options.db etf.db forex.db fable.db pumpfun.db lab.db props.db)
+#   nba/nfl/mlb — sibling sport-prop engines (unique snapshot names, local file keeps that name)
+DB_NAMES=(futures crypto catalyst options etf forex fable pumpfun lab wnba nba nfl mlb wnba_data nba_data nfl_data mlb_data)
+DB_FILES=(futures.db prices.db catalyst.db options.db etf.db forex.db fable.db pumpfun.db lab.db props.db nba_props.db nfl_props.db mlb_props.db wnba_gamelogs.db nba_gamelogs.db nfl_gamelogs.db mlb_gamelogs.db)
 DB_REMOTE=(
     /home/joe/futures-app/futures.db
     /home/joe/crypto-app/prices.db
@@ -65,12 +66,22 @@ DB_REMOTE=(
     /home/joe/pumpfun-trader/pumpfun.db
     /home/joe/strategy-lab/lab.db
     /home/joe/wnba-props/props.db
+    /home/joe/nba-props/props.db
+    /home/joe/nfl-props/props.db
+    /home/joe/mlb-props/props.db
+    /home/joe/wnba-props/data/wnba.db
+    /home/joe/nba-props/data/nba.db
+    /home/joe/nfl-props/data/nfl.db
+    /home/joe/mlb-props/data/mlb.db
 )
 FABLE_DIR="$HOME/trading/fable-trader"
 PUMPFUN_DIR="$HOME/trading/pumpfun-trader"
 LAB_DIR="$HOME/trading/strategy-lab"
 WNBA_DIR="$HOME/trading/wnba-props"
-DB_DEST=("$LOCAL_DIR" "$CRYPTO_DIR" "$CATALYST_DIR" "$OPTIONS_DIR" "$ETF_DIR" "$FOREX_DIR" "$FABLE_DIR" "$PUMPFUN_DIR" "$LAB_DIR" "$WNBA_DIR")
+NBA_DIR="$HOME/trading/nba-props"
+NFL_DIR="$HOME/trading/nfl-props"
+MLB_DIR="$HOME/trading/mlb-props"
+DB_DEST=("$LOCAL_DIR" "$CRYPTO_DIR" "$CATALYST_DIR" "$OPTIONS_DIR" "$ETF_DIR" "$FOREX_DIR" "$FABLE_DIR" "$PUMPFUN_DIR" "$LAB_DIR" "$WNBA_DIR" "$NBA_DIR" "$NFL_DIR" "$MLB_DIR" "$WNBA_DIR/data" "$NBA_DIR/data" "$NFL_DIR/data" "$MLB_DIR/data")
 
 # Reverse push (Mac → adamserver): the public viewer's Reports tab serves
 # stock dossiers + publishable reports that are GENERATED on this Mac. Source
