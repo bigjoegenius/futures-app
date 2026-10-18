@@ -410,6 +410,30 @@ Safe to delete once the fix has run clean for a day or two.
 - Explain what each command does before running it
 - Check in after each step before moving to the next
 
+### Progress display for long tasks (Joe's standing request, 2026-10-13)
+Whenever you start a task you expect to take **longer than ~5 minutes**:
+- Before starting, show a visual progress tracker: a numbered step list
+  (✅ done / ▶️ in progress / ⬜ to do), a progress bar, and an estimated
+  time until done.
+- Re-show the updated tracker each time a step finishes so Joe always
+  knows where you are.
+- Keep it cheap: get the time estimate from a quick Sonnet subagent
+  (Agent tool, `model: "sonnet"`, low effort) instead of spending lots of
+  main-model tokens on it. A rough estimate is fine.
+- If the task-list tools (TaskCreate / TaskUpdate) are available, use them
+  as well — they show the list live in the app.
+- Short tasks (under ~5 minutes) don't need a tracker.
+
+Example:
+```
+Progress: [██████░░░░] 3 of 5 steps · about 4 min left
+✅ 1. Read the strategy code
+✅ 2. Write the fix
+▶️ 3. Run the backtest
+⬜ 4. Commit and push
+⬜ 5. Update CLAUDE.md
+```
+
 ## How to continue in a new chat
 1. Open Claude desktop app — Code tab
 2. Point it at ~/futures-app folder
