@@ -3,7 +3,7 @@
 ## What this is
 A desktop/server application that fetches live futures market data,
 stores historical OHLCV candle data locally, analyzes markets using
-AI/ML, and trades (or suggests trades) via an Apex Trading account.
+AI/ML, and trades (or suggests trades) via Schwab (paper for now).
 
 ## Owner
 Joe Thieme — beginner programmer, Mac user (MacBook Air)
@@ -11,7 +11,8 @@ Located in Sevierville, TN area
 
 ## Trading style
 Futures day trading and scalping
-Connected to Apex Trading account for execution
+Paper-trading on Schwab; option signals on ES/NQ/GC are surfaced as Schwab
+ETF options (SPY/QQQ/GLD) — see futures_options_scanner.py.
 
 ## Related project
 This project builds on patterns from ~/crypto-app (crypto perpetual futures).
@@ -28,8 +29,10 @@ Key reusable components from crypto-app:
 - Will expand to broker-native feeds as needed
 
 ## Broker
-Apex Trading (futures)
-- Will integrate for live trading or trade suggestions
+Schwab (equity + futures options)
+- Futures-options signals (ES/NQ/GC) are surfaced as Schwab ETF options: SPY / QQQ / GLD
+- Paper for now; a live broker module (broker.py) is not yet wired
+- NOTE: this app does NOT use Apex / NinjaTrader / TopStep — Schwab only
 
 ## Tech stack
 - Language: Python 3.14.3
@@ -164,11 +167,23 @@ Automated 24/7 data collection running on adamserver with sync back to Mac.
 - Logs: `/home/joe/futures-app/fetch.log`
 
 **Mac side** (launchd):
-- `~/futures-app/sync_from_adamserver.sh` — rsync wrapper (portable mkdir lock)
+- `~/futures-app/sync_from_adamserver.sh` — snapshot-then-rsync wrapper (portable mkdir lock)
 - `~/Library/LaunchAgents/com.joe.futures-sync.plist` — fires at :45 every hour
-- Pulls `adamserver:~/futures-app/futures.db` → `~/futures-app/futures.db` via SSH+rsync
-- ~6 seconds per sync (18MB compressed from ~100MB file)
-- Logs: `~/futures-app/sync.log`
+- Pulls 6 DBs (futures/prices/catalyst/options/etf/forex) via consistent server-side
+  snapshots — NOT the live files
+- Logs: `~/futures-app/sync.log` (per-DB `quick_check` results + `sync done` summary line)
+
+**Snapshot flow (reworked 2026-06-11):** rsyncing the live WAL-mode DBs while
+writers were active produced torn Mac copies (prices.db failed
+`PRAGMA quick_check` with invalid pages) and silently dropped un-checkpointed
+-wal content. Now one ssh call runs a python3 one-shot `Connection.backup()`
+per DB into `/tmp/mac-sync-snap` on adamserver (tmpfs/RAM, not the full root
+disk; ~2 s for the 2.9 GB prices.db; consistent point-in-time copy, WAL folded
+in, writers unblocked). Each snapshot is rsynced to the Mac (page layout is
+preserved, so delta transfer stays cheap), local stale `-wal`/`-shm` sidecars
+are removed, the Mac copy is verified with `PRAGMA quick_check(5)`, and the
+server-side snapshots are deleted. To add a new DB (e.g. fable.db) append one
+entry to each of the 4 parallel arrays at the top of the script.
 
 **Cadence:** server fetches at :07 → Mac pulls at :45 → local db never more than ~38 min stale.
 
@@ -188,7 +203,7 @@ Automated 24/7 data collection running on adamserver with sync back to Mac.
 - Sync is server → Mac only. Paper trades written locally get overwritten. Put autopilot
   on adamserver too if you want persistent trade state.
 
-### Phase 5 — Apex Trading integration (NOT STARTED)
+### Phase 5 — Live broker integration (NOT STARTED)
 Paper trading only for now. No broker module. When ready, add `broker.py` with a
 clean place_order / close_position interface and wire it from strategy_engine.py.
 
@@ -264,7 +279,7 @@ Both stamped with the appropriate tag so Gmail filters can sort them.
 - `sugar_carry` uses a 20-day trend + end-of-month proxy instead of true contango term structure.
 - News fixtures are baked-in calendar events; doesn't cover every headline.
 
-### Phase 7 — Apex Trading integration (NOT STARTED)
+### Phase 7 — Live broker integration (NOT STARTED)
 Same as Phase 5 above — build `broker.py` and wire into `strategy_engine.py` when ready.
 
 ### Phase 6b — Confidence scoring + email overhaul (2026-04-21) ✅
@@ -444,6 +459,87 @@ restarted. Now strategy #29 in the live catalog.
 - `backtests/monthly_liquidity_sweep_GC_{15m,1h,1d}.png` — monthly P&L
 - `backtests/scatter_liquidity_sweep_GC_{15m,1h,1d}.png` — trade scatter
 - `backtests/liquidity_sweep_report.txt` — full text report (emailed to baldwetcoby)
+
+### Session log — 2026-06-11 (Frozen forming-bar fix in fetch_data.py)
+yfinance `ticker.history()` includes the still-FORMING bar. fetch_data.py's
+plain INSERT + IntegrityError-skip froze that partial row at first sight:
+every daily bar since the collector went live (2026-04-21) had a wrong
+open/high/low/close (close frozen at the first post-midnight fetch), every
+1h bar was a ~7-minute snapshot (hourly fetch at :07 inserts the forming
+hour, the completed hour is later skipped as a duplicate), 1-in-4 15m and
+1-in-12 5m bars likewise. This silently distorted all daily/1h strategy
+signals, backtests, and fable-trader's futures_daily reads.
+**Fix:** rows at/past MAX(datetime) per (symbol,timeframe) are UPSERTed
+(`ON CONFLICT(symbol,timeframe,datetime) DO UPDATE`) so the forming bar
+refreshes on every fetch until its session closes; older rows keep the cheap
+INSERT/skip path. New `--force` flag UPSERTs every fetched row (repair mode).
+**Repair:** deployed to adamserver + `fetch_data.py --all --force` run
+2026-06-11, 0 errors — daily (full history), 1h (730d), 5m/15m (60d) fully
+re-downloaded and overwritten. Residual: 1m bars older than yfinance's 7d
+window (one frozen minute per fetch-hour, ~1.7% of 1m rows 04-21→06-04)
+cannot be re-fetched and stay frozen. Pre-repair backup:
+`adamserver:~/futures-app/futures.db.bak-frozenbar-20260611`.
+Same fix applied to forex-app (same file lineage). crypto-app unaffected
+(Coinbase collector, different write path).
+
+### Session log — 2026-10-10 (1d hygiene: weekend/holiday stubs, self-heal, GC re-roll)
+yfinance labels its FORMING daily bar with the wall-clock date. From 2026-04,
+the forming-bar UPSERT therefore stored Sunday-evening Globex opens as fake
+Sunday bars (324 rows) and CME-holiday sessions as holiday bars (50 rows:
+05-25/06-19/07-03/09-07). It also left weekday bars frozen as partials after
+collector gaps (2026-08-03/08-04 on all symbols, YM 06-24) and kept every daily
+volume one session stale since ~06-10. Separately, yfinance re-rolled GC=F:
+the stored 2020-05→2026-09 history was a thin near-expiry contract (vol
+16–5k, some bars with open = high = low = close); yfinance now serves the
+front month (150–270k).
+**Rule now: yfinance SETTLED daily history is the arbiter.** fetch_data.py, 1d only:
+never stores weekend-dated bars; holds back a forming bar dated on an NYSE holiday
+(catalyst-etf/market_calendar.py by path); re-UPSERTs the trailing
+`HEAL_ROWS_1D=10` bars every fetch (price changes archived as `healed`);
+moves stored bars in that window that yfinance no longer returns into
+`candles_1d_quarantine` (`orphan`); skips yfinance all-NaN rows (CT/KC used
+to abort the whole symbol); rolls back on error. Intraday is untouched:
+Sunday 18:00+ ET intraday bars are real.
+**One-off repair** (`repair_1d_20261010.py`, run inside the fetch.lock flock):
+50 holiday_stub removed, 29 frozen_partial + 1,523 gc_reroll + 1,413 volume_lag
+replaced. Every old row is archived in `futures.db.candles_1d_quarantine`
+(kinds: weekend_stub/holiday_stub/frozen_partial/gc_reroll/volume_lag/healed/
+orphan), so the repair is restorable row by row. Pre-repair 1d snapshot:
+`adamserver:~/futures-app/futures_1d_pre_repair_20261010.db`. After the repair
+there are 0 price differences, 0 orphans and 0 missing bars vs yfinance; a
+handful of volumes flap between Yahoo responses.
+**Reader guard:** market_analyzer `_load_bars_db` drops weekend 1d rows (DB path
+only; the live Schwab path already labels weekdays). The Mac copy was reconciled
+from the server first (the Mac copy from 05-11 lacked the Schwab path; the old
+Mac copy is kept as `market_analyzer.py.mac-stale-20260511.bak`).
+futures-adaptive and options-autopilot were restarted and verified. On the server,
+load_bars serves 1d from Schwab for 11 symbols, so those engines only hit the
+DB (and the stubs) in Schwab fallback.
+Write-up: fable-trader/research/weekend_stub_replay/RESULTS.md.
+
+### Session log — 2026-10-10 (strategy_engine close_all no-op)
+`close_all()` did `load_bars(sym, "1h", 5) or load_bars(sym, "1d", 5)`. On the
+DB path (all backtests, BACKTEST_MODE=1) load_bars returns None below 30 rows,
+so nothing ever closed. On the Schwab path (`strategy_engine.py --test` on the
+server) `DataFrame or ...` raised "truth value is ambiguous". Its only caller is
+`backtest_symbol`'s end-of-test close, so every backtest silently dropped the
+position still open at the last bar. No live service calls close_all or
+backtest_symbol.
+**Fix:** `close_all(reason, prices=None, ts=None)`. backtest_symbol passes the
+final bar's close + timestamp. Otherwise `_last_known_price()` uses
+latest_prices, then the newest 1h/1d bar; with no price it logs and leaves the
+position open. `--test` now sets BACKTEST_MODE=1, so it can't write the live
+trades/equity tables. Backup: `strategy_engine.py.bak-closeall-20261010`
+(Mac + server). The live services were not restarted (their code paths are unchanged).
+**Impact (rerun of all 503 backtest_all combos on current data):** 166 of the 434
+combos with trades (38%) ended with a position open. The added trade moves total
+P&L by a median 2.3%; >25% in 9 combos; 1 sign flip (donchian_20 NQ 1d
+−$326 → +$320). Mean +$56, because open longs rode the Sep–Oct rally (the sign
+depends on the regime). futures-adaptive picks (combo_metrics test ≥ 2025-01-01,
+bars cut at the 06-08 validation date): ES/NQ/GC/CL picks keep their rank.
+RTY ema_cross vs donchian_55 becomes a near-tie on test P&L ($2,161 vs
+$2,179; donchian_55 already had the better PF 2.43 vs 1.25), so check it at the
+next adaptive review. YM gap_fade was never the test-P&L leader (it was picked on other criteria).
 
 ## Update this file every session
 Update whenever: a phase is completed, new libraries are installed,
