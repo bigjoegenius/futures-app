@@ -53,8 +53,10 @@ SNAP_DIR="/tmp/mac-sync-snap"
 #   lab      — strategy-lab 3 research-survivor books (dip/TOM/donchian)
 #   wnba     — wnba-props 3 player-prop books vs Kalshi
 #   nba/nfl/mlb — sibling sport-prop engines (unique snapshot names, local file keeps that name)
-DB_NAMES=(futures crypto catalyst options etf forex fable pumpfun lab wnba nba nfl mlb wnba_data nba_data nfl_data mlb_data)
-DB_FILES=(futures.db prices.db catalyst.db options.db etf.db forex.db fable.db pumpfun.db lab.db props.db nba_props.db nfl_props.db mlb_props.db wnba_gamelogs.db nba_gamelogs.db nfl_gamelogs.db mlb_gamelogs.db)
+#   swing    — crypto-swing-lab 🌊 Swing Lab paper books (DB-driven book list)
+#   apex     — apex-trader 🚀 one aggressive multi-sleeve $10k book (its deploy.sh EXCLUDES apex.db*: this mirror writes into the source dir)
+DB_NAMES=(futures crypto catalyst options etf forex fable pumpfun lab wnba nba nfl mlb wnba_data nba_data nfl_data mlb_data srot swing apex)
+DB_FILES=(futures.db prices.db catalyst.db options.db etf.db forex.db fable.db pumpfun.db lab.db props.db nba_props.db nfl_props.db mlb_props.db wnba_gamelogs.db nba_gamelogs.db nfl_gamelogs.db mlb_gamelogs.db srot.db swing.db apex.db)
 DB_REMOTE=(
     /home/joe/futures-app/futures.db
     /home/joe/crypto-app/prices.db
@@ -73,6 +75,9 @@ DB_REMOTE=(
     /home/joe/nba-props/data/nba.db
     /home/joe/nfl-props/data/nfl.db
     /home/joe/mlb-props/data/mlb.db
+    /home/joe/sector-rotation/srot.db
+    /home/joe/crypto-swing-lab/swing.db
+    /home/joe/apex-trader/apex.db
 )
 FABLE_DIR="$HOME/trading/fable-trader"
 PUMPFUN_DIR="$HOME/trading/pumpfun-trader"
@@ -81,7 +86,10 @@ WNBA_DIR="$HOME/trading/wnba-props"
 NBA_DIR="$HOME/trading/nba-props"
 NFL_DIR="$HOME/trading/nfl-props"
 MLB_DIR="$HOME/trading/mlb-props"
-DB_DEST=("$LOCAL_DIR" "$CRYPTO_DIR" "$CATALYST_DIR" "$OPTIONS_DIR" "$ETF_DIR" "$FOREX_DIR" "$FABLE_DIR" "$PUMPFUN_DIR" "$LAB_DIR" "$WNBA_DIR" "$NBA_DIR" "$NFL_DIR" "$MLB_DIR" "$WNBA_DIR/data" "$NBA_DIR/data" "$NFL_DIR/data" "$MLB_DIR/data")
+SROT_DIR="$HOME/trading/sector-rotation"
+SWING_DIR="$HOME/trading/crypto-swing-lab"
+APEX_DIR="$HOME/trading/apex-trader"
+DB_DEST=("$LOCAL_DIR" "$CRYPTO_DIR" "$CATALYST_DIR" "$OPTIONS_DIR" "$ETF_DIR" "$FOREX_DIR" "$FABLE_DIR" "$PUMPFUN_DIR" "$LAB_DIR" "$WNBA_DIR" "$NBA_DIR" "$NFL_DIR" "$MLB_DIR" "$WNBA_DIR/data" "$NBA_DIR/data" "$NFL_DIR/data" "$MLB_DIR/data" "$SROT_DIR" "$SWING_DIR" "$APEX_DIR")
 
 # Reverse push (Mac → adamserver): the public viewer's Reports tab serves
 # stock dossiers + publishable reports that are GENERATED on this Mac. Source
@@ -122,6 +130,15 @@ trap '/bin/rmdir "$LOCK_DIR" 2>/dev/null' EXIT
 {
     echo ""
     echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] ---- sync start ----"
+
+    # ── 0) Desktop read preflight ──────────────────────────────────────────
+    # The reports push at the end reads the iCloud Desktop, which macOS
+    # privacy (TCC) gates per launching binary — see bin/futures-sync-runner.c.
+    # Touch it up front so a first-run Allow prompt appears at once and a
+    # missing grant is logged plainly instead of surfacing only as rsync rc=23.
+    if [ -d "$CREATED_DIR" ] && ! /bin/ls "$CREATED_DIR" >/dev/null 2>&1; then
+        echo "  WARNING: cannot read $CREATED_DIR (macOS privacy/TCC) — reports push will fail"
+    fi
 
     # ── 1) Snapshot every DB server-side ──────────────────────────────────
     # One ssh call. name=path pairs go in as argv; the python comes in on
@@ -250,8 +267,13 @@ PYEOF
 
         # Dossiers: PDFs + their .md sources only. --delete mirrors removals,
         # guarded by a non-empty check so an unmounted/empty iCloud folder
-        # can never wipe the published set.
-        if [ -n "$(/bin/ls "$DOSSIERS_SRC"/*.pdf 2>/dev/null)" ]; then
+        # can never wipe the published set. An UNREADABLE folder is a failure,
+        # not an empty one — until 2026-09-26 a TCC block landed in the "no
+        # PDFs" branch and logged push_doss=0 while nothing was pushed.
+        if ! /bin/ls "$DOSSIERS_SRC" >/dev/null 2>&1; then
+            echo "  cannot read $DOSSIERS_SRC (macOS privacy/TCC?) — dossier push FAILED"
+            rc_push_doss=1
+        elif [ -n "$(/bin/ls "$DOSSIERS_SRC"/*.pdf 2>/dev/null)" ]; then
             /usr/bin/rsync -az --partial --delete \
                 --include='/*.pdf' --include='/sources/' --include='/sources/*.md' --exclude='*' \
                 -e 'ssh -o ConnectTimeout=10 -o BatchMode=yes' \
